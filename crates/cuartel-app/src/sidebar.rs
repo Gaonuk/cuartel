@@ -1,9 +1,16 @@
+use crate::sidecar_host::SidecarStatus;
 use crate::theme::Theme;
 use gpui::*;
+use parking_lot::Mutex;
+use std::sync::Arc;
+use std::time::Duration;
 
 pub struct Sidebar {
     sessions: Vec<SidebarItem>,
     selected_index: Option<usize>,
+    sidecar_status: Arc<Mutex<SidecarStatus>>,
+    last_seen_status: SidecarStatus,
+    _poll_task: Task<()>,
 }
 
 #[derive(Clone)]
@@ -23,10 +30,38 @@ enum SessionStatus {
 }
 
 impl Sidebar {
-    pub fn new(_cx: &mut Context<Self>) -> Self {
+    pub fn new(
+        sidecar_status: Arc<Mutex<SidecarStatus>>,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let status_poll = sidecar_status.clone();
+        let poll_task = cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(Duration::from_millis(500))
+                    .await;
+                let current = status_poll.lock().clone();
+                if this
+                    .update(cx, |sidebar, cx| {
+                        if sidebar.last_seen_status != current {
+                            sidebar.last_seen_status = current;
+                            cx.notify();
+                        }
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+
+        let initial = sidecar_status.lock().clone();
         Self {
             sessions: vec![],
             selected_index: None,
+            last_seen_status: initial,
+            sidecar_status,
+            _poll_task: poll_task,
         }
     }
 
@@ -151,7 +186,9 @@ impl Render for Sidebar {
                             .text_color(rgb(theme.text_muted))
                             .child("SERVERS"),
                     )
-                    .child(
+                    .child({
+                        let status = self.sidecar_status.lock().clone();
+                        let (dot_color, label, sub) = describe_sidecar(&status, &theme);
                         div()
                             .flex()
                             .items_center()
@@ -161,15 +198,59 @@ impl Render for Sidebar {
                                 div()
                                     .size(px(6.0))
                                     .rounded_full()
-                                    .bg(rgb(theme.success)),
+                                    .bg(rgb(dot_color)),
                             )
                             .child(
                                 div()
-                                    .text_sm()
-                                    .text_color(rgb(theme.text_secondary))
-                                    .child("This Mac (local)"),
-                            ),
-                    ),
+                                    .flex()
+                                    .flex_col()
+                                    .child(
+                                        div()
+                                            .text_sm()
+                                            .text_color(rgb(theme.text_secondary))
+                                            .child(label),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(rgb(theme.text_muted))
+                                            .child(sub),
+                                    ),
+                            )
+                    }),
             )
+    }
+}
+
+fn describe_sidecar(
+    status: &SidecarStatus,
+    theme: &Theme,
+) -> (u32, SharedString, SharedString) {
+    match status {
+        SidecarStatus::Idle => (
+            theme.text_muted,
+            "This Mac (local)".into(),
+            "sidecar idle".into(),
+        ),
+        SidecarStatus::Installing => (
+            theme.warning,
+            "This Mac (local)".into(),
+            "installing deps…".into(),
+        ),
+        SidecarStatus::Starting => (
+            theme.warning,
+            "This Mac (local)".into(),
+            "starting rivet…".into(),
+        ),
+        SidecarStatus::Ready => (
+            theme.success,
+            "This Mac (local)".into(),
+            "rivet ready on :6420".into(),
+        ),
+        SidecarStatus::Failed(msg) => (
+            theme.error,
+            "This Mac (local)".into(),
+            SharedString::from(format!("sidecar failed: {msg}")),
+        ),
     }
 }

@@ -1,7 +1,10 @@
 use crate::sidebar::Sidebar;
+use crate::sidecar_host::SidecarStatus;
 use crate::theme::Theme;
 use crate::workspace::WorkspaceView;
 use gpui::*;
+use parking_lot::Mutex;
+use std::sync::Arc;
 
 pub struct CuartelApp {
     sidebar: Entity<Sidebar>,
@@ -9,9 +12,12 @@ pub struct CuartelApp {
 }
 
 impl CuartelApp {
-    pub fn new(cx: &mut Context<Self>) -> Self {
+    pub fn new(
+        sidecar_status: Arc<Mutex<SidecarStatus>>,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let sidebar = cx.new(|cx| {
-            let mut sb = Sidebar::new(cx);
+            let mut sb = Sidebar::new(sidecar_status, cx);
             sb.add_session(
                 "demo-1".into(),
                 "fix-auth-bug",

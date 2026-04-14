@@ -2,7 +2,22 @@ use anyhow::{Result, anyhow};
 use log::{error, info};
 use std::path::PathBuf;
 use std::process::Stdio;
+use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader};
 use tokio::process::{Child, Command};
+
+async fn pipe_lines<R: AsyncRead + Unpin + Send + 'static>(tag: &'static str, reader: R) {
+    let mut lines = BufReader::new(reader).lines();
+    loop {
+        match lines.next_line().await {
+            Ok(Some(line)) => info!("[{tag}] {line}"),
+            Ok(None) => break,
+            Err(e) => {
+                error!("[{tag}] pipe read error: {e}");
+                break;
+            }
+        }
+    }
+}
 
 pub struct Sidecar {
     process: Option<Child>,
@@ -20,19 +35,47 @@ impl Sidecar {
     }
 
     pub async fn ensure_deps_installed(&self) -> Result<()> {
-        if !self.rivet_dir.join("node_modules").exists() {
-            info!("installing rivet sidecar dependencies...");
-            let status = Command::new("npm")
-                .arg("install")
-                .current_dir(&self.rivet_dir)
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .status()
-                .await?;
-            if !status.success() {
-                return Err(anyhow!("npm install failed in rivet sidecar directory"));
-            }
+        if self.rivet_dir.join("node_modules").exists() {
+            return Ok(());
         }
+        info!(
+            "installing rivet sidecar dependencies in {}...",
+            self.rivet_dir.display()
+        );
+        // Use `.output()` so both pipes are drained — otherwise a chatty npm
+        // can fill the stderr buffer and deadlock `.status()`.
+        let output = Command::new("npm")
+            .arg("install")
+            .current_dir(&self.rivet_dir)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .await?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            error!(
+                "npm install failed (exit {:?})\n--- stderr ---\n{}\n--- stdout ---\n{}",
+                output.status.code(),
+                stderr.trim(),
+                stdout.trim(),
+            );
+            let snippet: String = stderr
+                .lines()
+                .rev()
+                .take(3)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect::<Vec<_>>()
+                .join(" | ");
+            return Err(anyhow!(
+                "npm install failed (exit {:?}): {}",
+                output.status.code(),
+                snippet
+            ));
+        }
+        info!("npm install completed");
         Ok(())
     }
 
@@ -43,13 +86,20 @@ impl Sidecar {
         self.ensure_deps_installed().await?;
 
         info!("starting rivet sidecar on port {}...", self.port);
-        let child = Command::new("npx")
+        let mut child = Command::new("npx")
             .args(["tsx", "server.ts"])
             .current_dir(&self.rivet_dir)
             .env("PORT", self.port.to_string())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()?;
+
+        if let Some(stdout) = child.stdout.take() {
+            tokio::spawn(pipe_lines("rivet", stdout));
+        }
+        if let Some(stderr) = child.stderr.take() {
+            tokio::spawn(pipe_lines("rivet!", stderr));
+        }
 
         self.process = Some(child);
 
