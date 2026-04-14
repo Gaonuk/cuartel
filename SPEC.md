@@ -210,8 +210,29 @@ Tasks in this phase are split so multiple can run in parallel. Each task lists i
 | 3f | Wire event stream into terminal output (end-to-end Pi session) | `cuartel-app`, `cuartel-terminal` | 3b, 3c, 3e | C |
 | 3g | Permission prompt UI (approve/deny tool use) | `cuartel-app` | 3c | B |
 | 3h | Add Claude Code / Codex / OpenCode harness implementations | `cuartel-core` | 3e | D |
+| 3i | Harness availability detection (probe installed CLIs, cross-reference registry, return per-harness status) | `cuartel-core` | 3e | E |
+| 3j | Onboarding flow UI (first-run modal: detected harnesses, credential entry, default selection) | `cuartel-app`, `cuartel-db` | 3i, 3k | E |
+| 3k | Stopgap credential store (macOS Keychain-backed) until 5a's AES-256-GCM path lands | `cuartel-core`, `cuartel-db` | — | E |
+| 3l | Default-harness wiring in `SessionHost` (read selected harness + required env vars from config, inject into sidecar process env before spawn) | `cuartel-app` | 3f, 3j, 3k | E |
 
-**Group A** tasks (3a–3d) can all start in parallel today. Group B starts once 3a/3c land. Group C is the integration milestone. Group D is additive once 3e defines the harness trait.
+**Group A** tasks (3a–3d) can all start in parallel today. Group B starts once 3a/3c land. Group C is the integration milestone. Group D is additive once 3e defines the harness trait. **Group E** is the onboarding track — see the dedicated subsection below; 3i and 3k can start in parallel immediately, 3j merges their output, and 3l plugs the result into the 3f integration.
+
+#### Onboarding flow (3i–3l)
+
+The first time cuartel launches — and on demand from settings afterwards — the user lands on an onboarding panel that answers three questions: *what can I run, how do I authenticate it, and which one should be the default?* The flow is driven by data from three sources:
+
+1. **Harness registry** (from 3e) — the static list of supported harnesses (Pi, Claude Code, Codex, OpenCode, …). Each entry declares the CLI binaries / node packages it requires and the environment variables it reads for credentials. This is the source of truth for "what cuartel knows how to run".
+2. **System probe** (3i) — a pure async function that, for each registered harness, runs `which` / reads `process.versions` / checks package manifests to produce a `HarnessAvailability { installed: bool, version: Option<String>, install_hint: Option<String>, required_env: Vec<EnvVarSpec> }`. No UI, no side effects — just a snapshot the UI can render against.
+3. **Credential store** (3k) — a minimal key/value store scoped by provider id (e.g. `anthropic`, `openai`, `github-copilot`). For Phase 3 we back it with the macOS Keychain via the `security-framework` or `keyring` crate; 5a replaces the storage with the AES-256-GCM SQLite path without changing the read API (`get_api_key(provider_id) -> Option<String>`). This lets onboarding ship before Phase 5.
+
+The **onboarding UI** (3j) is a focused modal that sits above the workspace:
+
+- A **harness matrix** showing every registered harness with a status badge: `ready` (installed + all required env vars present), `needs credentials` (installed but missing keys), `not installed` (with a copy-paste install hint like `brew install pi` or `npm i -g @openai/codex`), or `unsupported on this platform`.
+- An **inline credential form** for each harness that needs keys — provider-aware labels and placeholders (`ANTHROPIC_OAUTH_TOKEN` vs `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GEMINI_API_KEY`, …), with masked inputs and an optional "test" button that tries a cheap provider endpoint to verify the key before saving.
+- A **default picker**: a radio list of the currently-ready harnesses, pinning one as the default for new sessions. The choice persists in the config store alongside credentials.
+- The modal is dismissible once at least one harness is `ready` and a default is selected; otherwise cuartel keeps surfacing it (with a banner in the sidebar) since no session can be created without a usable harness.
+
+The **default-harness wiring** (3l) changes `SessionHost` startup: before spawning the rivet sidecar, it reads the selected default harness + that harness's required env vars from the credential store and injects them into the `Command::new("npx")` environment via `.env(key, value)`. This matters because Pi / Claude Code / etc. run as subprocesses of the rivetkit server — they inherit the server's env, which inherits ours. Once 3l lands, launching cuartel with a configured ANTHROPIC_API_KEY in the onboarding flow Just Works without the user touching a shell. The current Phase 3f behaviour (terminal shows "Agent process exited" when no keys are configured) is the motivating failure mode for this whole subsection.
 
 ### Phase 4 -- Workspaces + Review
 
@@ -276,9 +297,9 @@ Split cleanly into three independent tracks; any two can be built in parallel by
 
 At any given moment, these tasks have no shared files and can be built in separate worktrees:
 
-- **Right now:** 3a, 3b, 3c, 3d, 4a, 4b, 4c, 4d, 5a, 5e, 6a, 6b, 7a, 7b, 7d
-- **Bottleneck tasks** (many others wait on them): 3a (state machine), 3e (harness trait), 5a (credential storage), 3f (first end-to-end Pi integration)
-- **Integration-only tasks** (must be done serially by a single agent): 3f, 4f, 5d, 7e
+- **Right now:** 3a, 3b, 3c, 3d, 3i, 3k, 4a, 4b, 4c, 4d, 5a, 5e, 6a, 6b, 7a, 7b, 7d
+- **Bottleneck tasks** (many others wait on them): 3a (state machine), 3e (harness trait), 5a (credential storage), 3f (first end-to-end Pi integration), 3j (onboarding UI unblocks actually running any harness in the app)
+- **Integration-only tasks** (must be done serially by a single agent): 3f, 3l, 4f, 5d, 7e
 
 ---
 
