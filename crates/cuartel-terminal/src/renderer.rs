@@ -139,6 +139,9 @@ impl Render for TerminalView {
             .visible_rows()
             .map(|r| r.clone())
             .collect();
+        let cursor_visible_row = self.term.grid.scrollback.len() + self.term.grid.cursor_row;
+        let cursor_col = self.term.grid.cursor_col;
+        let has_focus = self.focus_handle.is_focused(window);
         let error = self.error.clone();
 
         div()
@@ -158,11 +161,18 @@ impl Render for TerminalView {
             .children(error.map(|e| {
                 div().text_color(rgb(0xf38ba8)).child(e)
             }))
-            .children(rows.into_iter().map(render_row))
+            .children(rows.into_iter().enumerate().map(|(idx, row)| {
+                let cursor = if idx == cursor_visible_row {
+                    Some((cursor_col, has_focus))
+                } else {
+                    None
+                };
+                render_row(row, cursor)
+            }))
     }
 }
 
-fn render_row(row: Vec<Cell>) -> Div {
+fn render_row(row: Vec<Cell>, cursor: Option<(usize, bool)>) -> Div {
     // Group runs of same-style cells so we emit one child per run.
     let mut children: Vec<AnyElement> = Vec::new();
     let mut current_style: Option<CellStyle> = None;
@@ -182,7 +192,17 @@ fn render_row(row: Vec<Cell>) -> Div {
         children.push(el.into_any_element());
     };
 
-    for cell in row {
+    let cursor_col = cursor.map(|(c, _)| c);
+    let cursor_focused = cursor.map(|(_, f)| f).unwrap_or(false);
+
+    for (col, cell) in row.into_iter().enumerate() {
+        if Some(col) == cursor_col {
+            if let Some(s) = current_style.take() {
+                flush(&mut children, s, &mut current_text);
+            }
+            children.push(render_cursor_cell(&cell, cursor_focused));
+            continue;
+        }
         match current_style {
             Some(s) if s == cell.style => {
                 current_text.push(cell.ch);
@@ -205,6 +225,31 @@ fn render_row(row: Vec<Cell>) -> Div {
         .flex_row()
         .h(px(18.0))
         .children(children)
+}
+
+fn render_cursor_cell(cell: &Cell, focused: bool) -> AnyElement {
+    let ch = if cell.ch == ' ' || cell.ch == '\0' {
+        ' '
+    } else {
+        cell.ch
+    };
+    let text = ch.to_string();
+    let cursor_bg = 0xcdd6f4u32; // light
+    let cursor_fg = 0x11111bu32; // dark
+
+    let mut el = div().child(text);
+    if focused {
+        el = el.bg(rgb(cursor_bg)).text_color(rgb(cursor_fg));
+    } else {
+        el = el
+            .border_1()
+            .border_color(rgb(cursor_bg))
+            .text_color(fg_color(cell.style));
+    }
+    if cell.style.bold {
+        el = el.font_weight(FontWeight::BOLD);
+    }
+    el.into_any_element()
 }
 
 fn fg_color(style: CellStyle) -> Rgba {
