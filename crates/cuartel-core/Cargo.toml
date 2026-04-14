@@ -6,6 +6,7 @@ edition.workspace = true
 [dependencies]
 cuartel-db = { workspace = true }
 cuartel-rivet = { workspace = true }
+similar = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 anyhow = { workspace = true }
