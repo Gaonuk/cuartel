@@ -1337,6 +1337,7 @@ name = "cuartel-app"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "chrono",
  "cuartel-core",
  "cuartel-db",
  "cuartel-remote",

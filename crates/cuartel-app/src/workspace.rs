@@ -4,20 +4,33 @@ use gpui::*;
 
 pub struct WorkspaceView {
     terminal: Entity<TerminalView>,
-    name: SharedString,
+    label: SharedString,
+    agent: SharedString,
 }
 
 impl WorkspaceView {
-    pub fn new(name: &str, cx: &mut Context<Self>) -> Self {
+    pub fn new(
+        label: impl Into<SharedString>,
+        agent: impl Into<SharedString>,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let terminal = cx.new(|cx| TerminalView::new(cx));
         Self {
             terminal,
-            name: SharedString::from(name.to_string()),
+            label: label.into(),
+            agent: agent.into(),
         }
     }
 
-    pub fn terminal(&self) -> &Entity<TerminalView> {
-        &self.terminal
+    pub fn set_active_session(
+        &mut self,
+        label: SharedString,
+        agent: SharedString,
+        cx: &mut Context<Self>,
+    ) {
+        self.label = label;
+        self.agent = agent;
+        cx.notify();
     }
 }
 
@@ -46,7 +59,7 @@ impl Render for WorkspaceView {
                         div()
                             .flex()
                             .items_center()
-                            .gap_1()
+                            .gap_2()
                             .px_3()
                             .py_1()
                             .rounded_md()
@@ -54,8 +67,15 @@ impl Render for WorkspaceView {
                             .child(
                                 div()
                                     .text_sm()
+                                    .font_weight(FontWeight::SEMIBOLD)
                                     .text_color(rgb(theme.text_primary))
-                                    .child(self.name.clone()),
+                                    .child(self.label.clone()),
+                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(rgb(theme.text_muted))
+                                    .child(self.agent.clone()),
                             ),
                     ),
             )
