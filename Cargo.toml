@@ -33,6 +33,7 @@ chrono = { version = "0.4", features = ["serde"] }
 dirs = "6"
 futures = "0.3"
 rust-embed = "8"
+base64 = "0.22"
 
 cuartel-core = { path = "crates/cuartel-core" }
 cuartel-terminal = { path = "crates/cuartel-terminal" }
