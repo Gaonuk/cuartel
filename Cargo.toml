@@ -1,0 +1,44 @@
+[workspace]
+members = [
+    "crates/cuartel-app",
+    "crates/cuartel-terminal",
+    "crates/cuartel-core",
+    "crates/cuartel-rivet",
+    "crates/cuartel-remote",
+    "crates/cuartel-db",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0"
+
+[workspace.dependencies]
+gpui = "0.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+reqwest = { version = "0.12", features = ["json", "stream"] }
+tokio-tungstenite = { version = "0.24", features = ["native-tls"] }
+rusqlite = { version = "0.31", features = ["bundled"] }
+aes-gcm = "0.10"
+similar = "2"
+notify = "7"
+anyhow = "1"
+log = "0.4"
+env_logger = "0.11"
+uuid = { version = "1", features = ["v4"] }
+chrono = { version = "0.4", features = ["serde"] }
+dirs = "6"
+futures = "0.3"
+rust-embed = "8"
+
+cuartel-core = { path = "crates/cuartel-core" }
+cuartel-terminal = { path = "crates/cuartel-terminal" }
+cuartel-rivet = { path = "crates/cuartel-rivet" }
+cuartel-remote = { path = "crates/cuartel-remote" }
+cuartel-db = { path = "crates/cuartel-db" }
+
+[patch.crates-io]
+pathfinder_simd = { git = "https://github.com/PaulWagener/pathfinder", branch = "rename-simd-fmin-fmax" }

@@ -1,0 +1,23 @@
+[package]
+name = "cuartel-app"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "cuartel"
+path = "src/main.rs"
+
+[dependencies]
+gpui = { workspace = true }
+cuartel-core = { workspace = true }
+cuartel-terminal = { workspace = true }
+cuartel-rivet = { workspace = true }
+cuartel-remote = { workspace = true }
+cuartel-db = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+log = { workspace = true }
+env_logger = { workspace = true }
+uuid = { workspace = true }
+rust-embed = { workspace = true }

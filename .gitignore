@@ -1,0 +1,6 @@
+/target
+/rivet/node_modules
+/rivet/dist
+*.db
+*.key
+.DS_Store

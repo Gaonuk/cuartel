@@ -1,0 +1,13 @@
+[package]
+name = "cuartel-remote"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+cuartel-rivet = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+log = { workspace = true }
+tokio = { workspace = true }
+reqwest = { workspace = true }
