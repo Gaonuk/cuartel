@@ -1,4 +1,6 @@
+pub mod grid;
+pub mod pty;
 pub mod renderer;
-pub mod terminal;
 
+pub use pty::PtySession;
 pub use renderer::TerminalView;

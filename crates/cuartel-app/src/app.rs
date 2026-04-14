@@ -27,25 +27,7 @@ impl CuartelApp {
             sb
         });
 
-        let workspace = cx.new(|cx| {
-            let ws = WorkspaceView::new("fix-auth-bug", cx);
-            ws.terminal().update(cx, |term, cx| {
-                term.push_output("cuartel v0.1.0 - agent orchestration platform\n", cx);
-                term.push_output("connecting to rivet sidecar at localhost:6420...\n", cx);
-                term.push_output("\n", cx);
-                term.push_output(
-                    "  sessions: 2 active | server: this mac (local)\n",
-                    cx,
-                );
-                term.push_output(
-                    "  agents: Pi, Claude Code | status: ready\n",
-                    cx,
-                );
-                term.push_output("\n", cx);
-                term.push_output("ready. press Cmd+T to open a new agent tab.\n", cx);
-            });
-            ws
-        });
+        let workspace = cx.new(|cx| WorkspaceView::new("fix-auth-bug", cx));
 
         Self {
             sidebar,

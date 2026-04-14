@@ -7,3 +7,7 @@ edition.workspace = true
 gpui = { workspace = true }
 anyhow = { workspace = true }
 log = { workspace = true }
+portable-pty = "0.8"
+vte = "0.13"
+parking_lot = "0.12"
+crossbeam-channel = "0.5"
