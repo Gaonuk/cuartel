@@ -1,13 +1,13 @@
 //! HTTP client for the rivetkit manager API.
 //!
 //! Wraps the REST surface exposed by a running `rivetkit` server (the
-//! Node-side "manager" router). Actor-level RPC (session/prompt etc.) goes
-//! over WebSocket JSON-RPC and is not implemented here yet — that lands in
-//! Phase 3.
+//! Node-side "manager" router), plus actor-level actions invoked through
+//! the manager's gateway at `POST /gateway/{actor_id}/action/{name}`.
 
 use anyhow::{anyhow, Context, Result};
 use reqwest::Client;
-use serde::{Deserialize, Serialize};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use serde_json::{json, Value};
 use std::collections::HashMap;
 
 #[derive(Clone)]
@@ -163,6 +163,90 @@ impl RivetClient {
             .context("decode PUT /actors response")
     }
 
+    /// Invoke an actor action via the manager gateway and decode the JSON
+    /// `output` field into `T`.
+    ///
+    /// Corresponds to `POST /gateway/{actor_id}/action/{action}` with a JSON
+    /// body `{"args": [...]}`, as handled by rivetkit's
+    /// `handleAction`/`HttpActionRequestSchema`.
+    pub async fn call_action<T: DeserializeOwned>(
+        &self,
+        actor_id: &str,
+        action: &str,
+        args: Vec<Value>,
+    ) -> Result<T> {
+        let url = action_url(&self.base_url, actor_id, action);
+        let body = action_body(args);
+        let resp = self
+            .http
+            .post(&url)
+            .json(&body)
+            .send()
+            .await
+            .with_context(|| format!("POST {url}"))?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(anyhow!("POST {url} returned {status}: {body}"));
+        }
+        let envelope: ActionResponse<T> = resp
+            .json()
+            .await
+            .with_context(|| format!("decode action {action} response"))?;
+        Ok(envelope.output)
+    }
+
+    /// Create an agent-os session on the given VM actor.
+    ///
+    /// Maps to the `createSession(agentType, options?)` action from
+    /// `@rivet-dev/rivetkit` agent-os `buildSessionActions`.
+    pub async fn create_session(
+        &self,
+        actor_id: &str,
+        agent_type: &str,
+        options: Option<Value>,
+    ) -> Result<SessionRecord> {
+        let args = match options {
+            Some(opts) => vec![Value::String(agent_type.into()), opts],
+            None => vec![Value::String(agent_type.into())],
+        };
+        self.call_action(actor_id, "createSession", args).await
+    }
+
+    /// Send a prompt to an existing session and wait for the turn to end.
+    ///
+    /// Maps to the `sendPrompt(sessionId, text)` action. Blocks until the
+    /// ACP adapter returns the final `JsonRpcResponse`; intermediate agent
+    /// notifications are delivered via the event stream client (3c).
+    pub async fn send_prompt(
+        &self,
+        actor_id: &str,
+        session_id: &str,
+        text: &str,
+    ) -> Result<PromptResult> {
+        let args = vec![Value::String(session_id.into()), Value::String(text.into())];
+        self.call_action(actor_id, "sendPrompt", args).await
+    }
+
+    /// Destroy a session, freeing agent-os resources and removing persisted
+    /// state. Maps to the `destroySession(sessionId)` action.
+    pub async fn destroy_session(&self, actor_id: &str, session_id: &str) -> Result<()> {
+        let args = vec![Value::String(session_id.into())];
+        let _: Option<Value> = self.call_action(actor_id, "destroySession", args).await?;
+        Ok(())
+    }
+
+    /// List active (non-persisted) sessions on the given VM actor.
+    pub async fn list_sessions(&self, actor_id: &str) -> Result<Vec<SessionInfo>> {
+        self.call_action(actor_id, "listSessions", vec![]).await
+    }
+
+    /// Cancel an in-flight prompt turn for a session.
+    pub async fn cancel_prompt(&self, actor_id: &str, session_id: &str) -> Result<Value> {
+        let args = vec![Value::String(session_id.into())];
+        self.call_action(actor_id, "cancelPrompt", args).await
+    }
+
     pub async fn read_kv(&self, actor_id: &str, key: &str) -> Result<serde_json::Value> {
         let resp = self
             .http
@@ -176,5 +260,144 @@ impl RivetClient {
             .error_for_status()?;
         let body: serde_json::Value = resp.json().await?;
         Ok(body.get("value").cloned().unwrap_or(serde_json::Value::Null))
+    }
+}
+
+// --- Action envelope + session types -------------------------------------
+
+#[derive(Debug, Deserialize)]
+struct ActionResponse<T> {
+    output: T,
+}
+
+/// Result of a `sendPrompt` action: the raw JSON-RPC response from the ACP
+/// adapter plus the accumulated agent text for the turn.
+#[derive(Debug, Clone, Deserialize)]
+pub struct PromptResult {
+    pub response: Value,
+    #[serde(default)]
+    pub text: String,
+}
+
+/// Snapshot of a session as returned by `createSession`/`getSession`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct SessionRecord {
+    #[serde(rename = "sessionId")]
+    pub session_id: String,
+    #[serde(rename = "agentType")]
+    pub agent_type: String,
+    #[serde(default)]
+    pub capabilities: Value,
+    #[serde(rename = "agentInfo", default)]
+    pub agent_info: Option<Value>,
+}
+
+/// Lightweight listing entry from `listSessions`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct SessionInfo {
+    #[serde(rename = "sessionId")]
+    pub session_id: String,
+    #[serde(rename = "agentType")]
+    pub agent_type: String,
+}
+
+// --- Pure helpers (easy to unit test) ------------------------------------
+
+fn action_url(base: &str, actor_id: &str, action: &str) -> String {
+    format!("{}/gateway/{}/action/{}", base.trim_end_matches('/'), actor_id, action)
+}
+
+fn action_body(args: Vec<Value>) -> Value {
+    json!({ "args": args })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn action_url_uses_gateway_prefix() {
+        assert_eq!(
+            action_url("http://127.0.0.1:6420", "actor-123", "createSession"),
+            "http://127.0.0.1:6420/gateway/actor-123/action/createSession"
+        );
+    }
+
+    #[test]
+    fn action_url_trims_trailing_slash() {
+        assert_eq!(
+            action_url("http://localhost:6420/", "abc", "sendPrompt"),
+            "http://localhost:6420/gateway/abc/action/sendPrompt"
+        );
+    }
+
+    #[test]
+    fn action_body_wraps_args_array() {
+        let body = action_body(vec![
+            Value::String("pi".into()),
+            json!({ "cwd": "/workspace" }),
+        ]);
+        assert_eq!(body, json!({ "args": ["pi", { "cwd": "/workspace" }] }));
+    }
+
+    #[test]
+    fn action_body_empty_args_is_empty_array() {
+        assert_eq!(action_body(vec![]), json!({ "args": [] }));
+    }
+
+    #[test]
+    fn session_record_deserializes_from_camel_case_envelope() {
+        let resp: ActionResponse<SessionRecord> = serde_json::from_value(json!({
+            "output": {
+                "sessionId": "sess_abc",
+                "agentType": "pi",
+                "capabilities": { "prompts": true },
+                "agentInfo": { "name": "pi", "version": "0.1.0" }
+            }
+        }))
+        .unwrap();
+        assert_eq!(resp.output.session_id, "sess_abc");
+        assert_eq!(resp.output.agent_type, "pi");
+        assert_eq!(resp.output.capabilities, json!({ "prompts": true }));
+        assert_eq!(
+            resp.output.agent_info,
+            Some(json!({ "name": "pi", "version": "0.1.0" }))
+        );
+    }
+
+    #[test]
+    fn session_record_accepts_null_agent_info() {
+        let rec: SessionRecord = serde_json::from_value(json!({
+            "sessionId": "s1",
+            "agentType": "pi",
+            "capabilities": {},
+            "agentInfo": null
+        }))
+        .unwrap();
+        assert!(rec.agent_info.is_none());
+    }
+
+    #[test]
+    fn prompt_result_deserializes_with_default_text() {
+        let pr: PromptResult = serde_json::from_value(json!({
+            "response": { "jsonrpc": "2.0", "id": 1, "result": {} }
+        }))
+        .unwrap();
+        assert_eq!(pr.text, "");
+        assert_eq!(pr.response["jsonrpc"], "2.0");
+    }
+
+    #[test]
+    fn session_info_list_round_trips() {
+        let envelope: ActionResponse<Vec<SessionInfo>> = serde_json::from_value(json!({
+            "output": [
+                { "sessionId": "a", "agentType": "pi" },
+                { "sessionId": "b", "agentType": "pi" }
+            ]
+        }))
+        .unwrap();
+        assert_eq!(envelope.output.len(), 2);
+        assert_eq!(envelope.output[0].session_id, "a");
+        assert_eq!(envelope.output[1].agent_type, "pi");
     }
 }
