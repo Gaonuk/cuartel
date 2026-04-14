@@ -197,43 +197,88 @@ stateDiagram-v2
 - Rust HTTP client for Rivet AgentOS API (using `reqwest` + `tokio-tungstenite` for WebSocket)
 
 ### Phase 3 -- Agent Sessions
-- Create sessions for Pi (first supported agent, best Rivet support)
-- Stream session events to terminal in real-time via WebSocket/SSE
-- Permission handling UI (approve/deny tool use)
-- Session list in sidebar with status indicators
-- Add Claude Code, Codex, OpenCode harness support
+
+Tasks in this phase are split so multiple can run in parallel. Each task lists its crate, deps, and whether it blocks others.
+
+| ID | Task | Crate(s) | Depends on | Parallel group |
+|---|---|---|---|---|
+| 3a | Session state machine (Created→Booting→Ready→Running→Paused→Error) as pure logic with unit tests | `cuartel-core` | — | A |
+| 3b | Rivet session API wrappers: `createSession`, `sendPrompt`, `destroySession` | `cuartel-rivet` | — | A |
+| 3c | Rivet event stream client: WS/SSE subscription, typed `SessionEvent` enum | `cuartel-rivet` | — | A |
+| 3d | Sidebar session list view with status indicators (static model, fixture data) | `cuartel-app` | — | A |
+| 3e | Agent harness registry trait + Pi implementation | `cuartel-core` | 3a | B |
+| 3f | Wire event stream into terminal output (end-to-end Pi session) | `cuartel-app`, `cuartel-terminal` | 3b, 3c, 3e | C |
+| 3g | Permission prompt UI (approve/deny tool use) | `cuartel-app` | 3c | B |
+| 3h | Add Claude Code / Codex / OpenCode harness implementations | `cuartel-core` | 3e | D |
+
+**Group A** tasks (3a–3d) can all start in parallel today. Group B starts once 3a/3c land. Group C is the integration milestone. Group D is additive once 3e defines the harness trait.
 
 ### Phase 4 -- Workspaces + Review
-- Workspace model: one project directory mapped per workspace
-- Overlay filesystem: mount project at `/workspace` in VM, changes stay in overlay
-- Unified diff review panel (side-by-side or inline)
-- Accept/reject per-file or per-hunk before applying to host filesystem
-- Multiple tabs per workspace (different agents on same project)
+
+| ID | Task | Crate(s) | Depends on | Parallel group |
+|---|---|---|---|---|
+| 4a | Workspace model + project directory mapping (DB-backed) | `cuartel-core`, `cuartel-db` | — | A |
+| 4b | Overlay FS diff computation using `similar` (pure function: base tree + overlay tree → unified diff) | `cuartel-core` | — | A |
+| 4c | Diff review panel UI built against fixture diffs | `cuartel-app` | — | A |
+| 4d | Rivet file read/write/list wrappers for overlay snapshotting | `cuartel-rivet` | — | A |
+| 4e | Mount project at `/workspace` inside VM via Rivet filesystem API | `cuartel-core` | 4a, 4d | B |
+| 4f | Accept/reject per-file and per-hunk application to host FS | `cuartel-core`, `cuartel-app` | 4b, 4c, 4e | C |
+| 4g | Multiple tabs per workspace (multi-agent same project) | `cuartel-app` | 4a, 3f | C |
+
+**Group A** (4a–4d) is fully parallel. 4c in particular can ship without any VM — just render fixture diffs.
 
 ### Phase 5 -- Security + Ports
-- Auth gateway: reverse proxy on host that injects API keys into outgoing requests
-- Encrypted credential storage (AES-256-GCM in SQLite)
-- Port forwarding: opt-in per-port, sandbox-to-host and host-to-sandbox
-- Firewall rules: VMs have no direct access to secrets
+
+Split cleanly into three independent tracks; any two can be built in parallel by different agents.
+
+| ID | Task | Crate(s) | Depends on | Track |
+|---|---|---|---|---|
+| 5a | Encrypted credential storage: AES-256-GCM wrapper + `credentials` table + CRUD | `cuartel-db`, `cuartel-core` | — | Storage |
+| 5b | Settings UI for managing API keys / OAuth tokens | `cuartel-app` | 5a | Storage |
+| 5c | Auth gateway reverse proxy: intercept outgoing VM requests, inject credentials by hostname rule | `cuartel-core` (new `auth_gateway.rs`) | 5a | Gateway |
+| 5d | Audit log of credential-injected requests | `cuartel-core`, `cuartel-db` | 5c | Gateway |
+| 5e | Port forwarding: sandbox→host and host→sandbox, opt-in per port | `cuartel-rivet`, `cuartel-app` | — | Ports |
+| 5f | Firewall rules ensuring VMs cannot reach credential storage | `cuartel-core` | 5c | Gateway |
+
+**Storage**, **Gateway**, and **Ports** are independent tracks. 5a and 5e can start the same day.
 
 ### Phase 6 -- Checkpoint + Rewind
-- Checkpoint full VM state (leveraging Rivet's persistent state)
-- Restore from checkpoint in seconds
-- Fork a checkpoint into a new session/branch
-- Timeline UI showing checkpoint history
+
+| ID | Task | Crate(s) | Depends on | Parallel group |
+|---|---|---|---|---|
+| 6a | Rivet checkpoint API client (create, list, restore, delete) | `cuartel-rivet` | — | A |
+| 6b | Checkpoint metadata table + core API | `cuartel-core`, `cuartel-db` | — | A |
+| 6c | Timeline UI rendering checkpoint history | `cuartel-app` | 6b | B |
+| 6d | Fork-from-checkpoint flow (spawns new session branch) | `cuartel-core` | 6a, 6b, 3a | B |
 
 ### Phase 7 -- Remote via Tailscale
-- Tailscale integration: discover machines on your tailnet
-- Connect to remote Rivet AgentOS instances over Tailscale
-- Server registry in sidebar (local machine + remote machines)
-- Session sync: push a local session to remote, pull a remote session to local
-- Long-running jobs on Hetzner while using own API subscriptions
+
+| ID | Task | Crate(s) | Depends on | Parallel group |
+|---|---|---|---|---|
+| 7a | Tailscale discovery: list tailnet peers, reachability check | `cuartel-remote` | — | A |
+| 7b | Server registry table + CRUD (local + remote entries) | `cuartel-db`, `cuartel-remote` | — | A |
+| 7c | Server list UI in sidebar | `cuartel-app` | 7b | B |
+| 7d | Point rivet client at configurable base URL (local vs remote) | `cuartel-rivet` | — | A |
+| 7e | Session sync: push/pull session state between servers | `cuartel-remote` | 7a, 7b, 7d, 3b | C |
 
 ### Phase 8 -- Orchestration
-- Multi-agent pipelines (coder -> reviewer -> tester)
-- Cron-based scheduled agents
-- Durable workflows (survive crashes via Rivet's workflow engine)
-- Agent-to-agent file passing and coordination
+
+| ID | Task | Crate(s) | Depends on | Parallel group |
+|---|---|---|---|---|
+| 8a | Multi-agent pipeline DAG (coder → reviewer → tester) | `cuartel-core` | 3h | A |
+| 8b | Cron scheduler for agents | `cuartel-core` | 3a | A |
+| 8c | Durable workflow wrapper over Rivet's workflow engine | `cuartel-rivet`, `cuartel-core` | — | A |
+| 8d | Agent-to-agent file passing protocol | `cuartel-core` | 4e | B |
+
+---
+
+## Parallelism Quick Reference
+
+At any given moment, these tasks have no shared files and can be built in separate worktrees:
+
+- **Right now:** 3a, 3b, 3c, 3d, 4a, 4b, 4c, 4d, 5a, 5e, 6a, 6b, 7a, 7b, 7d
+- **Bottleneck tasks** (many others wait on them): 3a (state machine), 3e (harness trait), 5a (credential storage), 3f (first end-to-end Pi integration)
+- **Integration-only tasks** (must be done serially by a single agent): 3f, 4f, 5d, 7e
 
 ---
 
