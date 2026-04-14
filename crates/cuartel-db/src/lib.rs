@@ -1,5 +1,6 @@
 pub mod crypto;
 pub mod schema;
+pub mod workspaces;
 
 use anyhow::Result;
 use rusqlite::Connection;
