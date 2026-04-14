@@ -87,13 +87,24 @@ pub struct LaunchCommand {
 /// One raw chunk of output from a running agent. The harness is responsible
 /// for turning harness-specific wire formats into this common enum so the
 /// rest of the app can be written against a single event shape.
+///
+/// Note: the serde tag here is `kind` (cuartel's internal persistence /
+/// bus format). Individual harnesses — Pi, Claude Code, etc. — receive
+/// their own upstream wire formats (Pi uses `type`, for example) and must
+/// translate into this enum in `parse_line`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "kind", content = "data")]
 pub enum HarnessEvent {
     /// Plain text output to render in the terminal.
     Output(String),
     /// Agent wants to run a tool; UI should surface the permission prompt.
-    ToolUse { name: String, input: String },
+    /// `input` is the raw tool-call payload as structured JSON so downstream
+    /// consumers (permission UI, audit log) can introspect fields without
+    /// re-parsing a stringified blob.
+    ToolUse {
+        name: String,
+        input: serde_json::Value,
+    },
     /// Agent finished the current prompt successfully.
     Completed,
     /// Agent failed. Payload is a human readable reason.
@@ -114,6 +125,7 @@ impl HarnessEvent {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum HarnessError {
     MissingEnv(String),
     ParseError(String),
@@ -223,6 +235,12 @@ impl AgentHarness for PiHarness {
     }
 
     fn install_steps(&self) -> Vec<InstallStep> {
+        // SECURITY: the bootstrap uses `curl | sh`, which is a known
+        // supply-chain vector. It is acceptable here because the script is
+        // served over TLS from a domain we control and runs inside a
+        // throwaway VM — but any change to the install URL or runner host
+        // must re-audit this. Production builds should eventually pin a
+        // checksum and verify it before executing.
         vec![
             InstallStep {
                 label: "Install Pi CLI".into(),
@@ -244,7 +262,7 @@ impl AgentHarness for PiHarness {
         prompt: &str,
         env: &HashMap<String, String>,
     ) -> Result<LaunchCommand, HarnessError> {
-        for key in PI_REQUIRED_ENV {
+        for key in self.required_env_keys() {
             if !env.contains_key(*key) {
                 return Err(HarnessError::MissingEnv((*key).into()));
             }
@@ -284,8 +302,8 @@ impl AgentHarness for PiHarness {
                     .to_string();
                 let input = value
                     .get("input")
-                    .map(|v| v.to_string())
-                    .unwrap_or_default();
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null);
                 HarnessEvent::ToolUse { name, input }
             }
             "completed" => HarnessEvent::Completed,
@@ -402,7 +420,7 @@ mod tests {
         match ev {
             HarnessEvent::ToolUse { name, input } => {
                 assert_eq!(name, "bash");
-                assert!(input.contains("ls"));
+                assert_eq!(input.get("cmd").and_then(|v| v.as_str()), Some("ls"));
             }
             other => panic!("expected ToolUse, got {other:?}"),
         }
@@ -456,7 +474,7 @@ mod tests {
         assert!(ev.to_session_event().is_none());
         let ev = HarnessEvent::ToolUse {
             name: "bash".into(),
-            input: "{}".into(),
+            input: serde_json::json!({}),
         };
         assert!(ev.to_session_event().is_none());
     }
