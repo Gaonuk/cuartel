@@ -1,4 +1,4 @@
-use cuartel_rivet::client::RivetClient;
+use cuartel_rivet::client::{GetOrCreateRequest, RivetClient};
 use cuartel_rivet::sidecar::Sidecar;
 use parking_lot::Mutex;
 use std::path::PathBuf;
@@ -59,9 +59,11 @@ impl SidecarHost {
                         return;
                     }
 
-                    *client_bg.lock() =
-                        Some(RivetClient::new(&format!("http://localhost:{}", port)));
+                    let client = RivetClient::new(&format!("http://localhost:{}", port));
+                    *client_bg.lock() = Some(client.clone());
                     *status_bg.lock() = SidecarStatus::Ready;
+
+                    smoke_test(&client).await;
 
                     // Keep the runtime alive so the child process isn't reaped.
                     std::future::pending::<()>().await;
@@ -74,6 +76,51 @@ impl SidecarHost {
 
     pub fn status(&self) -> Arc<Mutex<SidecarStatus>> {
         self.status.clone()
+    }
+
+    #[allow(dead_code)]
+    pub fn client(&self) -> Arc<Mutex<Option<RivetClient>>> {
+        self.client.clone()
+    }
+}
+
+async fn smoke_test(client: &RivetClient) {
+    match client.health().await {
+        Ok(h) => log::info!(
+            "rivet health: status={} runtime={} version={}",
+            h.status,
+            h.runtime,
+            h.version,
+        ),
+        Err(e) => {
+            log::warn!("rivet /health failed: {e}");
+            return;
+        }
+    }
+
+    match client.list_actor_names("default").await {
+        Ok(names) => {
+            let registered: Vec<&String> = names.names.keys().collect();
+            log::info!("rivet registered actors (default ns): {:?}", registered);
+        }
+        Err(e) => log::warn!("rivet /actors/names failed: {e}"),
+    }
+
+    // Exercise the idempotent get-or-create path for our `vm` actor.
+    let req = GetOrCreateRequest {
+        name: "vm",
+        key: "cuartel-main",
+        runner_name_selector: "default",
+        crash_policy: "kill",
+    };
+    match client.get_or_create_actor(&req).await {
+        Ok(res) => log::info!(
+            "rivet actor vm/{}: id={} created={}",
+            req.key,
+            res.actor.actor_id,
+            res.created,
+        ),
+        Err(e) => log::warn!("rivet PUT /actors failed: {e}"),
     }
 }
 

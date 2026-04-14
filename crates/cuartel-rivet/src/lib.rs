@@ -1,6 +1,5 @@
 pub mod client;
-pub mod filesystem;
-pub mod network;
-pub mod session;
 pub mod sidecar;
-pub mod vm;
+
+pub use client::{Actor, GetOrCreateRequest, GetOrCreateResult, Health, RivetClient};
+pub use sidecar::Sidecar;

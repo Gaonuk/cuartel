@@ -1,6 +1,14 @@
-use anyhow::Result;
+//! HTTP client for the rivetkit manager API.
+//!
+//! Wraps the REST surface exposed by a running `rivetkit` server (the
+//! Node-side "manager" router). Actor-level RPC (session/prompt etc.) goes
+//! over WebSocket JSON-RPC and is not implemented here yet — that lands in
+//! Phase 3.
+
+use anyhow::{anyhow, Context, Result};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 #[derive(Clone)]
 pub struct RivetClient {
@@ -8,29 +16,71 @@ pub struct RivetClient {
     http: Client,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct VmInstance {
-    pub id: String,
-    pub tags: Vec<String>,
+#[derive(Debug, Clone, Deserialize)]
+pub struct Health {
+    pub status: String,
+    pub runtime: String,
+    pub version: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SessionInfo {
-    pub session_id: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SessionEvent {
-    pub method: String,
+#[derive(Debug, Clone, Deserialize)]
+pub struct ActorName {
     #[serde(default)]
-    pub data: serde_json::Value,
+    pub metadata: serde_json::Value,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ExecResult {
-    pub stdout: String,
-    pub stderr: String,
-    pub exit_code: i32,
+#[derive(Debug, Clone, Deserialize)]
+pub struct ActorNames {
+    pub names: HashMap<String, ActorName>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct Actor {
+    pub actor_id: String,
+    pub name: String,
+    #[serde(default)]
+    pub key: Option<String>,
+    pub namespace_id: String,
+    pub runner_name_selector: String,
+    pub create_ts: i64,
+    #[serde(default)]
+    pub connectable_ts: Option<i64>,
+    #[serde(default)]
+    pub destroy_ts: Option<i64>,
+    #[serde(default)]
+    pub sleep_ts: Option<i64>,
+    #[serde(default)]
+    pub start_ts: Option<i64>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ActorList {
+    pub actors: Vec<Actor>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct GetOrCreateResult {
+    pub actor: Actor,
+    pub created: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct GetOrCreateRequest<'a> {
+    pub name: &'a str,
+    pub key: &'a str,
+    pub runner_name_selector: &'a str,
+    pub crash_policy: &'a str,
+}
+
+impl Default for GetOrCreateRequest<'static> {
+    fn default() -> Self {
+        Self {
+            name: "vm",
+            key: "default",
+            runner_name_selector: "default",
+            crash_policy: "kill",
+        }
+    }
 }
 
 impl RivetClient {
@@ -45,115 +95,86 @@ impl RivetClient {
         &self.base_url
     }
 
-    pub async fn get_or_create_vm(&self, tags: &[&str]) -> Result<VmInstance> {
+    pub async fn health(&self) -> Result<Health> {
         let resp = self
             .http
-            .post(format!("{}/vm/getOrCreate", self.base_url))
-            .json(&serde_json::json!({ "tags": tags }))
+            .get(format!("{}/health", self.base_url))
             .send()
-            .await?
+            .await
+            .context("GET /health")?
             .error_for_status()?;
-        Ok(resp.json().await?)
+        resp.json::<Health>()
+            .await
+            .context("decode /health response")
     }
 
-    pub async fn create_session(
-        &self,
-        vm_id: &str,
-        agent: &str,
-        env: &std::collections::HashMap<String, String>,
-    ) -> Result<SessionInfo> {
+    pub async fn list_actor_names(&self, namespace: &str) -> Result<ActorNames> {
         let resp = self
             .http
-            .post(format!("{}/vm/{}/createSession", self.base_url, vm_id))
-            .json(&serde_json::json!({
-                "agent": agent,
-                "env": env,
-            }))
+            .get(format!("{}/actors/names", self.base_url))
+            .query(&[("namespace", namespace)])
             .send()
-            .await?
+            .await
+            .context("GET /actors/names")?
             .error_for_status()?;
-        Ok(resp.json().await?)
+        resp.json::<ActorNames>()
+            .await
+            .context("decode /actors/names response")
     }
 
-    pub async fn send_prompt(
-        &self,
-        vm_id: &str,
-        session_id: &str,
-        prompt: &str,
-    ) -> Result<serde_json::Value> {
-        let resp = self
-            .http
-            .post(format!("{}/vm/{}/sendPrompt", self.base_url, vm_id))
-            .json(&serde_json::json!({
-                "sessionId": session_id,
-                "prompt": prompt,
-            }))
-            .send()
-            .await?
-            .error_for_status()?;
-        Ok(resp.json().await?)
-    }
-
-    pub async fn read_file(&self, vm_id: &str, path: &str) -> Result<Vec<u8>> {
-        let resp = self
-            .http
-            .get(format!("{}/vm/{}/readFile", self.base_url, vm_id))
-            .query(&[("path", path)])
-            .send()
-            .await?
-            .error_for_status()?;
-        Ok(resp.bytes().await?.to_vec())
-    }
-
-    pub async fn write_file(&self, vm_id: &str, path: &str, content: &[u8]) -> Result<()> {
-        self.http
-            .post(format!("{}/vm/{}/writeFile", self.base_url, vm_id))
-            .json(&serde_json::json!({
-                "path": path,
-                "content": base64_encode(content),
-            }))
-            .send()
-            .await?
-            .error_for_status()?;
-        Ok(())
-    }
-
-    pub async fn exec(&self, vm_id: &str, command: &str) -> Result<ExecResult> {
-        let resp = self
-            .http
-            .post(format!("{}/vm/{}/exec", self.base_url, vm_id))
-            .json(&serde_json::json!({ "command": command }))
-            .send()
-            .await?
-            .error_for_status()?;
-        Ok(resp.json().await?)
-    }
-}
-
-fn base64_encode(data: &[u8]) -> String {
-    use std::fmt::Write;
-    let mut s = String::with_capacity(data.len() * 4 / 3 + 4);
-    for chunk in data.chunks(3) {
-        let b = match chunk.len() {
-            3 => [chunk[0], chunk[1], chunk[2]],
-            2 => [chunk[0], chunk[1], 0],
-            _ => [chunk[0], 0, 0],
-        };
-        let n = ((b[0] as u32) << 16) | ((b[1] as u32) << 8) | (b[2] as u32);
-        const CHARS: &[u8] =
-            b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-        let _ = write!(s, "{}", CHARS[((n >> 18) & 63) as usize] as char);
-        let _ = write!(s, "{}", CHARS[((n >> 12) & 63) as usize] as char);
-        if chunk.len() > 1 {
-            let _ = write!(s, "{}", CHARS[((n >> 6) & 63) as usize] as char);
-        } else {
-            s.push('=');
+    pub async fn list_actors(&self, name: &str, key: Option<&str>) -> Result<Vec<Actor>> {
+        let mut query: Vec<(&str, &str)> = vec![("name", name)];
+        if let Some(k) = key {
+            query.push(("key", k));
         }
-        if chunk.len() > 2 {
-            let _ = write!(s, "{}", CHARS[(n & 63) as usize] as char);
-        } else {
-            s.push('=');
-        }
+        let resp = self
+            .http
+            .get(format!("{}/actors", self.base_url))
+            .query(&query)
+            .send()
+            .await
+            .context("GET /actors")?
+            .error_for_status()?;
+        Ok(resp
+            .json::<ActorList>()
+            .await
+            .context("decode /actors response")?
+            .actors)
     }
-    s
+
+    pub async fn get_or_create_actor(
+        &self,
+        req: &GetOrCreateRequest<'_>,
+    ) -> Result<GetOrCreateResult> {
+        let resp = self
+            .http
+            .put(format!("{}/actors", self.base_url))
+            .json(req)
+            .send()
+            .await
+            .context("PUT /actors")?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(anyhow!("PUT /actors returned {status}: {body}"));
+        }
+        resp.json::<GetOrCreateResult>()
+            .await
+            .context("decode PUT /actors response")
+    }
+
+    pub async fn read_kv(&self, actor_id: &str, key: &str) -> Result<serde_json::Value> {
+        let resp = self
+            .http
+            .get(format!(
+                "{}/actors/{}/kv/keys/{}",
+                self.base_url, actor_id, key
+            ))
+            .send()
+            .await
+            .context("GET /actors/{id}/kv/keys/{key}")?
+            .error_for_status()?;
+        let body: serde_json::Value = resp.json().await?;
+        Ok(body.get("value").cloned().unwrap_or(serde_json::Value::Null))
+    }
 }
