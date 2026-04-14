@@ -31,6 +31,52 @@ impl TerminalView {
         view
     }
 
+    /// Terminal view with no local PTY — all output is driven externally via
+    /// [`TerminalView::write_bytes`] / [`TerminalView::write_text`]. Used by
+    /// the Rivet session orchestrator to display remote agent output.
+    pub fn new_headless(cx: &mut Context<Self>) -> Self {
+        let focus_handle = cx.focus_handle();
+        Self {
+            term: Terminal::new(DEFAULT_ROWS, DEFAULT_COLS),
+            pty: None,
+            focus_handle,
+            focused_once: false,
+            error: None,
+            _poll_task: None,
+        }
+    }
+
+    /// Feed raw bytes into the grid parser, as if they had arrived from a
+    /// PTY. Safe to call whether or not a local PTY is running.
+    pub fn push_bytes(&mut self, bytes: &[u8], cx: &mut Context<Self>) {
+        if bytes.is_empty() {
+            return;
+        }
+        self.term.advance(bytes);
+        cx.notify();
+    }
+
+    /// Convenience for feeding a UTF-8 string into the grid. Newlines are
+    /// translated to CRLF so the parser positions the cursor correctly.
+    pub fn push_text(&mut self, text: &str, cx: &mut Context<Self>) {
+        let mut buf = Vec::with_capacity(text.len());
+        for line in text.split_inclusive('\n') {
+            if let Some(stripped) = line.strip_suffix('\n') {
+                buf.extend_from_slice(stripped.as_bytes());
+                buf.extend_from_slice(b"\r\n");
+            } else {
+                buf.extend_from_slice(line.as_bytes());
+            }
+        }
+        self.push_bytes(&buf, cx);
+    }
+
+    /// Display an error banner at the bottom of the view.
+    pub fn set_error(&mut self, error: Option<SharedString>, cx: &mut Context<Self>) {
+        self.error = error;
+        cx.notify();
+    }
+
     fn start_shell(&mut self, cx: &mut Context<Self>) {
         match PtySession::spawn_shell(DEFAULT_ROWS as u16, DEFAULT_COLS as u16) {
             Ok(session) => {
