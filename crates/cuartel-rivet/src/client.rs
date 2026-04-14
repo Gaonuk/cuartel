@@ -247,6 +247,16 @@ impl RivetClient {
         self.call_action(actor_id, "cancelPrompt", args).await
     }
 
+    /// Open a WebSocket event subscription against the given actor. See
+    /// [`crate::events`] for the full set of broadcast channels.
+    pub async fn subscribe_events(
+        &self,
+        actor_id: &str,
+        channels: &[&str],
+    ) -> Result<crate::events::EventStream> {
+        crate::events::subscribe(&self.base_url, actor_id, channels).await
+    }
+
     pub async fn read_kv(&self, actor_id: &str, key: &str) -> Result<serde_json::Value> {
         let resp = self
             .http
