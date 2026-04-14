@@ -4,3 +4,4 @@ pub mod checkpoint;
 pub mod config;
 pub mod overlay;
 pub mod session;
+pub mod workspace;
