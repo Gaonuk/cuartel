@@ -4,6 +4,7 @@ use parking_lot::Mutex;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::thread;
+use tokio::runtime::{Handle, Runtime};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SidecarStatus {
@@ -16,8 +17,8 @@ pub enum SidecarStatus {
 
 pub struct SidecarHost {
     status: Arc<Mutex<SidecarStatus>>,
-    #[allow(dead_code)]
     client: Arc<Mutex<Option<RivetClient>>>,
+    handle: Handle,
 }
 
 impl SidecarHost {
@@ -25,23 +26,21 @@ impl SidecarHost {
         let status = Arc::new(Mutex::new(SidecarStatus::Idle));
         let client = Arc::new(Mutex::new(None));
 
+        // Build the tokio runtime synchronously so the handle is usable
+        // immediately — SessionHost needs it before the sidecar is ready.
+        let rt: Runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .worker_threads(2)
+            .thread_name("cuartel-tokio")
+            .build()
+            .expect("failed to build tokio runtime");
+        let handle = rt.handle().clone();
+
         let status_bg = status.clone();
         let client_bg = client.clone();
         thread::Builder::new()
             .name("cuartel-sidecar".into())
             .spawn(move || {
-                let rt = match tokio::runtime::Builder::new_multi_thread()
-                    .enable_all()
-                    .worker_threads(2)
-                    .build()
-                {
-                    Ok(rt) => rt,
-                    Err(e) => {
-                        *status_bg.lock() = SidecarStatus::Failed(format!("runtime: {e}"));
-                        return;
-                    }
-                };
-
                 rt.block_on(async move {
                     let mut sidecar = Sidecar::new(rivet_dir, port);
 
@@ -49,6 +48,7 @@ impl SidecarHost {
                     if let Err(e) = sidecar.ensure_deps_installed().await {
                         log::error!("rivet deps install failed: {e}");
                         *status_bg.lock() = SidecarStatus::Failed(format!("npm install: {e}"));
+                        std::future::pending::<()>().await;
                         return;
                     }
 
@@ -56,6 +56,7 @@ impl SidecarHost {
                     if let Err(e) = sidecar.start().await {
                         log::error!("rivet sidecar start failed: {e}");
                         *status_bg.lock() = SidecarStatus::Failed(format!("start: {e}"));
+                        std::future::pending::<()>().await;
                         return;
                     }
 
@@ -65,22 +66,34 @@ impl SidecarHost {
 
                     smoke_test(&client).await;
 
-                    // Keep the runtime alive so the child process isn't reaped.
+                    // Keep the runtime alive so the child process + any
+                    // caller-spawned tasks keep running.
                     std::future::pending::<()>().await;
                 });
             })
             .expect("failed to spawn sidecar thread");
 
-        Self { status, client }
+        Self {
+            status,
+            client,
+            handle,
+        }
     }
 
     pub fn status(&self) -> Arc<Mutex<SidecarStatus>> {
         self.status.clone()
     }
 
-    #[allow(dead_code)]
     pub fn client(&self) -> Arc<Mutex<Option<RivetClient>>> {
         self.client.clone()
+    }
+
+    /// Handle to the shared tokio runtime driving the sidecar. Callers may
+    /// `.spawn(future)` to run additional async work on this runtime —
+    /// notably, SessionHost uses it to drive Rivet client calls and the
+    /// event stream without needing its own runtime.
+    pub fn runtime_handle(&self) -> Handle {
+        self.handle.clone()
     }
 }
 

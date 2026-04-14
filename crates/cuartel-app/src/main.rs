@@ -1,6 +1,7 @@
 mod app;
 mod assets;
 mod permission_prompt;
+mod session_host;
 mod sidebar;
 mod sidecar_host;
 mod theme;
@@ -29,6 +30,8 @@ fn main() {
             }
 
             let status_handle = sidecar.status();
+            let client_handle = sidecar.client();
+            let runtime_handle = sidecar.runtime_handle();
             let bounds = Bounds::centered(None, size(px(1200.0), px(800.0)), cx);
             cx.open_window(
                 WindowOptions {
@@ -39,7 +42,16 @@ fn main() {
                     }),
                     ..Default::default()
                 },
-                |_, cx| cx.new(|cx| CuartelApp::new(status_handle, cx)),
+                |_, cx| {
+                    cx.new(|cx| {
+                        CuartelApp::new(
+                            status_handle,
+                            client_handle,
+                            runtime_handle,
+                            cx,
+                        )
+                    })
+                },
             )
             .unwrap();
         });

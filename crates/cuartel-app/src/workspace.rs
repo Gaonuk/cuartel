@@ -15,10 +15,10 @@ impl WorkspaceView {
     pub fn new(
         label: impl Into<SharedString>,
         agent: impl Into<SharedString>,
+        terminal: Entity<TerminalView>,
         permission_prompt: Entity<PermissionPrompt>,
         cx: &mut Context<Self>,
     ) -> Self {
-        let terminal = cx.new(|cx| TerminalView::new(cx));
         // When the permission queue changes we need to re-render the workspace
         // so the banner can appear/disappear.
         let observer = cx.observe(&permission_prompt, |_, _, cx| cx.notify());

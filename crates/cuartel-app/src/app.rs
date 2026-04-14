@@ -1,4 +1,5 @@
-use crate::permission_prompt::{PendingPermission, PermissionPrompt};
+use crate::permission_prompt::{PendingPermission, PermissionDecision, PermissionPrompt};
+use crate::session_host::SessionHost;
 use crate::sidebar::{SessionItem, SessionSelected, Sidebar};
 use crate::sidecar_host::SidecarStatus;
 use crate::theme::Theme;
@@ -6,21 +7,27 @@ use crate::workspace::WorkspaceView;
 use chrono::{Duration as ChronoDuration, Utc};
 use cuartel_core::agent::AgentType;
 use cuartel_core::session::SessionState;
+use cuartel_rivet::client::RivetClient;
+use cuartel_terminal::TerminalView;
 use gpui::*;
 use parking_lot::Mutex;
 use serde_json::json;
 use std::sync::Arc;
+use tokio::runtime::Handle;
 
 pub struct CuartelApp {
     sidebar: Entity<Sidebar>,
     workspace: Entity<WorkspaceView>,
-    #[allow(dead_code)] // retained so the entity is alive; wired fully in 3f
+    #[allow(dead_code)]
     permission_prompt: Entity<PermissionPrompt>,
+    session_host: Entity<SessionHost>,
 }
 
 impl CuartelApp {
     pub fn new(
         sidecar_status: Arc<Mutex<SidecarStatus>>,
+        rivet_client: Arc<Mutex<Option<RivetClient>>>,
+        runtime_handle: Handle,
         cx: &mut Context<Self>,
     ) -> Self {
         let fixtures = fixture_sessions();
@@ -39,10 +46,14 @@ impl CuartelApp {
         let initial_session_label = initial_label.clone();
 
         let sidebar = cx.new(|cx| {
-            let mut sb = Sidebar::new(sidecar_status, cx);
+            let mut sb = Sidebar::new(sidecar_status.clone(), cx);
             sb.set_sessions(fixtures, cx);
             sb
         });
+
+        // Single headless terminal shared between the workspace (for
+        // rendering) and the session host (for feeding remote agent output).
+        let terminal = cx.new(|cx| TerminalView::new_headless(cx));
 
         let permission_prompt = cx.new(|cx| {
             let mut pp = PermissionPrompt::new(cx);
@@ -54,15 +65,34 @@ impl CuartelApp {
 
         let workspace = cx.new({
             let permission_prompt = permission_prompt.clone();
-            |cx| WorkspaceView::new(initial_label, initial_agent, permission_prompt, cx)
+            let terminal = terminal.clone();
+            |cx| WorkspaceView::new(initial_label, initial_agent, terminal, permission_prompt, cx)
+        });
+
+        let session_host = cx.new({
+            let terminal = terminal.clone();
+            let permission_prompt = permission_prompt.clone();
+            move |cx| {
+                SessionHost::new(
+                    runtime_handle,
+                    rivet_client,
+                    sidecar_status,
+                    terminal,
+                    permission_prompt,
+                    cx,
+                )
+            }
         });
 
         cx.subscribe(&sidebar, Self::on_session_selected).detach();
+        cx.subscribe(&permission_prompt, Self::on_permission_decision)
+            .detach();
 
         Self {
             sidebar,
             workspace,
             permission_prompt,
+            session_host,
         }
     }
 
@@ -76,6 +106,21 @@ impl CuartelApp {
         let agent = event.agent.clone();
         self.workspace.update(cx, |ws, cx| {
             ws.set_active_session(label, agent, cx);
+        });
+    }
+
+    fn on_permission_decision(
+        &mut self,
+        _prompt: Entity<PermissionPrompt>,
+        event: &PermissionDecision,
+        cx: &mut Context<Self>,
+    ) {
+        let (id, approve) = match event {
+            PermissionDecision::Approve { id, .. } => (id.clone(), true),
+            PermissionDecision::Deny { id, .. } => (id.clone(), false),
+        };
+        self.session_host.update(cx, |host, _cx| {
+            host.decide(id, approve);
         });
     }
 }
@@ -96,7 +141,8 @@ impl Render for CuartelApp {
 }
 
 /// Fixture sessions exercising every `SessionState` variant the sidebar can
-/// render. Kept here until 3f lands real Rivet-backed sessions.
+/// render. Real Rivet-backed sessions are driven by `SessionHost`; the
+/// sidebar fixtures stay until 3d evolves to list those instead.
 fn fixture_sessions() -> Vec<SessionItem> {
     let now = Utc::now();
     vec![
@@ -152,8 +198,11 @@ fn fixture_sessions() -> Vec<SessionItem> {
     ]
 }
 
-/// Fixture permission requests exercising a range of tool-use shapes. Drops
-/// away once Phase 3f wires real `RivetEvent::PermissionRequest` deliveries.
+/// Fixture permission requests shown above the terminal so the approve/deny
+/// flow is exercisable without waiting for Pi to actually emit a
+/// `request/permission`. Real permission events from `SessionHost` are
+/// enqueued into the same `PermissionPrompt` entity and appended to the
+/// queue.
 fn fixture_permissions(session_id: &str, session_label: &SharedString) -> Vec<PendingPermission> {
     vec![
         PendingPermission::new(
