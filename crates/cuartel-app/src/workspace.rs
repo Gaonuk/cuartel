@@ -1,24 +1,33 @@
+use crate::permission_prompt::PermissionPrompt;
 use crate::theme::Theme;
 use cuartel_terminal::TerminalView;
 use gpui::*;
 
 pub struct WorkspaceView {
     terminal: Entity<TerminalView>,
+    permission_prompt: Entity<PermissionPrompt>,
     label: SharedString,
     agent: SharedString,
+    _observer: Subscription,
 }
 
 impl WorkspaceView {
     pub fn new(
         label: impl Into<SharedString>,
         agent: impl Into<SharedString>,
+        permission_prompt: Entity<PermissionPrompt>,
         cx: &mut Context<Self>,
     ) -> Self {
         let terminal = cx.new(|cx| TerminalView::new(cx));
+        // When the permission queue changes we need to re-render the workspace
+        // so the banner can appear/disappear.
+        let observer = cx.observe(&permission_prompt, |_, _, cx| cx.notify());
         Self {
             terminal,
+            permission_prompt,
             label: label.into(),
             agent: agent.into(),
+            _observer: observer,
         }
     }
 
@@ -35,8 +44,9 @@ impl WorkspaceView {
 }
 
 impl Render for WorkspaceView {
-    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::dark();
+        let show_prompt = !self.permission_prompt.read(cx).is_empty();
 
         div()
             .id("workspace")
@@ -79,11 +89,10 @@ impl Render for WorkspaceView {
                             ),
                     ),
             )
+            .children(show_prompt.then(|| self.permission_prompt.clone()))
             .child(
                 // Terminal area
-                div()
-                    .flex_1()
-                    .child(self.terminal.clone()),
+                div().flex_1().child(self.terminal.clone()),
             )
     }
 }

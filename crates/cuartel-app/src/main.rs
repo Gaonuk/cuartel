@@ -1,5 +1,6 @@
 mod app;
 mod assets;
+mod permission_prompt;
 mod sidebar;
 mod sidecar_host;
 mod theme;
