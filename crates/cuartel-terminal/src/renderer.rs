@@ -12,6 +12,7 @@ pub struct TerminalView {
     pty: Option<Arc<PtySession>>,
     focus_handle: FocusHandle,
     focused_once: bool,
+    headless: bool,
     error: Option<SharedString>,
     _poll_task: Option<Task<()>>,
 }
@@ -24,6 +25,7 @@ impl TerminalView {
             pty: None,
             focus_handle,
             focused_once: false,
+            headless: false,
             error: None,
             _poll_task: None,
         };
@@ -40,7 +42,8 @@ impl TerminalView {
             term: Terminal::new(DEFAULT_ROWS, DEFAULT_COLS),
             pty: None,
             focus_handle,
-            focused_once: false,
+            focused_once: true,
+            headless: true,
             error: None,
             _poll_task: None,
         }
@@ -174,7 +177,7 @@ impl Focusable for TerminalView {
 
 impl Render for TerminalView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        if !self.focused_once {
+        if !self.headless && !self.focused_once {
             window.focus(&self.focus_handle);
             self.focused_once = true;
         }

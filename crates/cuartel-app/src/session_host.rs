@@ -37,6 +37,13 @@ use std::time::Duration;
 use tokio::runtime::Handle;
 use tokio::sync::mpsc::{self, error::TryRecvError, UnboundedReceiver, UnboundedSender};
 
+#[derive(Clone, Debug)]
+pub struct SessionStateChange {
+    pub state: SessionState,
+}
+
+impl EventEmitter<SessionStateChange> for SessionHost {}
+
 const VM_ACTOR_NAME: &str = "vm";
 const VM_ACTOR_KEY: &str = "cuartel-pi-session";
 const AGENT_TYPE: &str = "pi";
@@ -162,12 +169,10 @@ impl SessionHost {
         }
     }
 
-    #[allow(dead_code)]
     pub fn send_prompt(&self, text: String) {
         let _ = self.cmd_tx.send(SessionHostCommand::SendPrompt(text));
     }
 
-    #[allow(dead_code)]
     pub fn state(&self) -> &SessionState {
         &self.session.state
     }
@@ -207,6 +212,7 @@ impl SessionHost {
                 match self.session.apply(core_ev.clone()) {
                     Ok(state) => {
                         log::info!("[session] state → {state}");
+                        cx.emit(SessionStateChange { state: state.clone() });
                     }
                     Err(e) => {
                         log::debug!("[session] rejected transition {core_ev:?}: {e}");

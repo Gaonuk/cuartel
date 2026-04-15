@@ -1,11 +1,11 @@
 use crate::onboarding_view::{OnboardingCompleted, OnboardingView};
-use crate::permission_prompt::{PendingPermission, PermissionDecision, PermissionPrompt};
-use crate::session_host::SessionHost;
+use crate::permission_prompt::{PermissionDecision, PermissionPrompt};
+use crate::session_host::{SessionHost, SessionStateChange};
 use crate::sidebar::{SessionItem, SessionSelected, Sidebar};
 use crate::sidecar_host::SidecarStatus;
 use crate::theme::Theme;
-use crate::workspace::WorkspaceView;
-use chrono::{Duration as ChronoDuration, Utc};
+use crate::workspace::{PromptSubmitted, WorkspaceView};
+use chrono::Utc;
 use cuartel_core::agent::{AgentType, HarnessRegistry};
 use cuartel_core::credential_store::CredentialStore;
 use cuartel_core::onboarding::OnboardingConfig;
@@ -14,11 +14,13 @@ use cuartel_rivet::client::RivetClient;
 use cuartel_terminal::TerminalView;
 use gpui::*;
 use parking_lot::Mutex;
-use serde_json::json;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::runtime::Handle;
+
+const SESSION_LABEL: &str = "cuartel-main";
+const SESSION_AGENT: AgentType = AgentType::Pi;
 
 pub struct CuartelApp {
     sidebar: Entity<Sidebar>,
@@ -44,46 +46,26 @@ impl CuartelApp {
         sidecar_env: HashMap<String, String>,
         cx: &mut Context<Self>,
     ) -> Self {
-        let fixtures = fixture_sessions();
-        let initial_label = fixtures
-            .first()
-            .map(|s| s.label.clone())
-            .unwrap_or_else(|| SharedString::from("(no sessions)"));
-        let initial_agent = fixtures
-            .first()
-            .map(|s| SharedString::from(s.agent.display_name().to_string()))
-            .unwrap_or_else(|| SharedString::from(""));
-        let initial_session_id = fixtures
-            .first()
-            .map(|s| s.id.to_string())
-            .unwrap_or_default();
-        let initial_session_label = initial_label.clone();
+        let initial_state = SessionState::Created;
+        let initial_session = make_session_item(initial_state.clone());
 
         let sidebar = cx.new(|cx| {
             let mut sb = Sidebar::new(sidecar_status.clone(), cx);
-            sb.set_sessions(fixtures, cx);
+            sb.set_sessions(vec![initial_session], cx);
             sb
         });
 
-        // Single headless terminal shared between the workspace (for
-        // rendering) and the session host (for feeding remote agent output).
         let terminal = cx.new(|cx| TerminalView::new_headless(cx));
 
-        let permission_prompt = cx.new(|cx| {
-            let mut pp = PermissionPrompt::new(cx);
-            for pending in fixture_permissions(&initial_session_id, &initial_session_label) {
-                pp.enqueue(pending, cx);
-            }
-            pp
-        });
+        let permission_prompt = cx.new(|cx| PermissionPrompt::new(cx));
 
         let workspace = cx.new({
             let permission_prompt = permission_prompt.clone();
             let terminal = terminal.clone();
             |cx| {
                 WorkspaceView::new(
-                    initial_label,
-                    initial_agent,
+                    SharedString::from(SESSION_LABEL),
+                    SharedString::from(SESSION_AGENT.display_name()),
                     terminal,
                     permission_prompt,
                     cx,
@@ -108,13 +90,12 @@ impl CuartelApp {
         });
 
         cx.subscribe(&sidebar, Self::on_session_selected).detach();
+        cx.subscribe(&session_host, Self::on_session_state_change)
+            .detach();
+        cx.subscribe(&workspace, Self::on_prompt_submitted).detach();
         cx.subscribe(&permission_prompt, Self::on_permission_decision)
             .detach();
 
-        // Only show the onboarding modal on first run (until the user
-        // clicks "Save and continue"). After that it's dismissed for the
-        // rest of the session; surfacing it from settings is a Phase 3
-        // follow-up.
         let onboarding_view = if !onboarding_config.completed {
             let initial_default = onboarding_config.default_harness.clone();
             let ov =
@@ -134,6 +115,32 @@ impl CuartelApp {
             onboarding_config,
             data_dir,
         }
+    }
+
+    fn on_session_state_change(
+        &mut self,
+        _host: Entity<SessionHost>,
+        event: &SessionStateChange,
+        cx: &mut Context<Self>,
+    ) {
+        let item = make_session_item(event.state.clone());
+        self.sidebar.update(cx, |sb, cx| {
+            sb.set_sessions(vec![item], cx);
+        });
+        self.workspace.update(cx, |ws, cx| {
+            ws.set_session_state(event.state.clone(), cx);
+        });
+    }
+
+    fn on_prompt_submitted(
+        &mut self,
+        _view: Entity<WorkspaceView>,
+        event: &PromptSubmitted,
+        cx: &mut Context<Self>,
+    ) {
+        self.session_host.update(cx, |host, _| {
+            host.send_prompt(event.text.clone());
+        });
     }
 
     fn on_onboarding_completed(
@@ -159,14 +166,9 @@ impl CuartelApp {
     fn on_session_selected(
         &mut self,
         _sidebar: Entity<Sidebar>,
-        event: &SessionSelected,
-        cx: &mut Context<Self>,
+        _event: &SessionSelected,
+        _cx: &mut Context<Self>,
     ) {
-        let label = event.label.clone();
-        let agent = event.agent.clone();
-        self.workspace.update(cx, |ws, cx| {
-            ws.set_active_session(label, agent, cx);
-        });
     }
 
     fn on_permission_decision(
@@ -202,103 +204,7 @@ impl Render for CuartelApp {
     }
 }
 
-/// Fixture sessions exercising every `SessionState` variant the sidebar can
-/// render. Real Rivet-backed sessions are driven by `SessionHost`; the
-/// sidebar fixtures stay until 3d evolves to list those instead.
-fn fixture_sessions() -> Vec<SessionItem> {
-    let now = Utc::now();
-    vec![
-        SessionItem::new(
-            "sess-fix-auth",
-            "fix-auth-bug",
-            AgentType::Pi,
-            SessionState::Running,
-        )
-        .with_created_at(now - ChronoDuration::minutes(2)),
-        SessionItem::new(
-            "sess-dark-mode",
-            "add-dark-mode",
-            AgentType::ClaudeCode,
-            SessionState::Ready,
-        )
-        .with_created_at(now - ChronoDuration::minutes(12)),
-        SessionItem::new(
-            "sess-refactor",
-            "refactor-orm",
-            AgentType::Codex,
-            SessionState::Booting,
-        )
-        .with_created_at(now - ChronoDuration::seconds(8)),
-        SessionItem::new(
-            "sess-tests",
-            "flaky-test-hunt",
-            AgentType::OpenCode,
-            SessionState::Paused,
-        )
-        .with_created_at(now - ChronoDuration::hours(1)),
-        SessionItem::new(
-            "sess-migration",
-            "db-migration-0042",
-            AgentType::Pi,
-            SessionState::Reviewing,
-        )
-        .with_created_at(now - ChronoDuration::minutes(35)),
-        SessionItem::new(
-            "sess-crash",
-            "rate-limit-retry",
-            AgentType::ClaudeCode,
-            SessionState::Error("anthropic 429 timeout".into()),
-        )
-        .with_created_at(now - ChronoDuration::minutes(47)),
-        SessionItem::new(
-            "sess-snapshot",
-            "pre-deploy-checkpoint",
-            AgentType::Pi,
-            SessionState::Checkpointed,
-        )
-        .with_created_at(now - ChronoDuration::hours(3)),
-    ]
-}
-
-/// Fixture permission requests shown above the terminal so the approve/deny
-/// flow is exercisable without waiting for Pi to actually emit a
-/// `request/permission`. Real permission events from `SessionHost` are
-/// enqueued into the same `PermissionPrompt` entity and appended to the
-/// queue.
-fn fixture_permissions(session_id: &str, session_label: &SharedString) -> Vec<PendingPermission> {
-    vec![
-        PendingPermission::new(
-            "perm-001",
-            session_id,
-            session_label.clone(),
-            "bash",
-            json!({
-                "command": "cargo test -p cuartel-core --lib session::tests::happy_path_create_boot_prompt_complete",
-                "cwd": "/workspace",
-                "timeout_ms": 60000
-            }),
-        ),
-        PendingPermission::new(
-            "perm-002",
-            session_id,
-            session_label.clone(),
-            "write_file",
-            json!({
-                "path": "/workspace/src/auth/middleware.rs",
-                "contents_preview": "pub fn verify_jwt(token: &str) -> Result<Claims, AuthError> {\n    // ...\n}",
-                "byte_len": 1248
-            }),
-        ),
-        PendingPermission::new(
-            "perm-003",
-            session_id,
-            session_label.clone(),
-            "fetch",
-            json!({
-                "url": "https://api.github.com/repos/anthropics/anthropic-sdk-python/issues",
-                "method": "GET",
-                "headers": { "Accept": "application/vnd.github+json" }
-            }),
-        ),
-    ]
+fn make_session_item(state: SessionState) -> SessionItem {
+    SessionItem::new("cuartel-main", SESSION_LABEL, SESSION_AGENT, state)
+        .with_created_at(Utc::now())
 }
