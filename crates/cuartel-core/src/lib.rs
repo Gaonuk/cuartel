@@ -10,3 +10,4 @@ pub mod sqlite_credential_store;
 pub mod overlay;
 pub mod session;
 pub mod workspace;
+pub mod workspace_mount;
