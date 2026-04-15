@@ -1,6 +1,7 @@
 use cuartel_rivet::client::{GetOrCreateRequest, RivetClient};
 use cuartel_rivet::sidecar::Sidecar;
 use parking_lot::Mutex;
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::thread;
@@ -22,7 +23,15 @@ pub struct SidecarHost {
 }
 
 impl SidecarHost {
-    pub fn spawn(rivet_dir: PathBuf, port: u16) -> Self {
+    /// Spawn the rivet sidecar process on a dedicated tokio runtime.
+    ///
+    /// `env` is forwarded verbatim to `Command::new("npx").env(...)` before
+    /// the child is started (task 3l). Typical usage: pass the credentials
+    /// for the default harness (e.g. `ANTHROPIC_API_KEY`) so the rivetkit
+    /// server — and by extension every agent-os subprocess it spawns —
+    /// inherits them. Environment changes after spawn are not respected;
+    /// restart the sidecar to pick up new vars.
+    pub fn spawn(rivet_dir: PathBuf, port: u16, env: HashMap<String, String>) -> Self {
         let status = Arc::new(Mutex::new(SidecarStatus::Idle));
         let client = Arc::new(Mutex::new(None));
 
@@ -43,6 +52,7 @@ impl SidecarHost {
             .spawn(move || {
                 rt.block_on(async move {
                     let mut sidecar = Sidecar::new(rivet_dir, port);
+                    sidecar.set_env(env);
 
                     *status_bg.lock() = SidecarStatus::Installing;
                     if let Err(e) = sidecar.ensure_deps_installed().await {

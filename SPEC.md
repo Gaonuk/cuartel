@@ -372,6 +372,118 @@ The Rust app does NOT embed Rivet (it's Node.js). Instead:
 
 ---
 
+## Phase 9 -- Multi-Agent Harness Support (Claude Code, Codex, OpenCode via ACP)
+
+The current architecture hardcodes Pi as the only agent. This phase makes the
+default harness configurable and adds Claude Code as a first-class agent via
+the `@agentclientprotocol/claude-agent-acp` adapter.
+
+### Background: ACP (Agent Client Protocol)
+
+ACP is a JSON-RPC protocol over stdin/stdout that standardises how coding
+agents communicate with host applications. Both Pi and Claude Code now ship
+ACP adapters:
+
+- **Pi**: `@rivet-dev/agent-os-pi` (already in `rivet/`)
+- **Claude Code**: `@agentclientprotocol/claude-agent-acp` (new — wraps
+  `@anthropic-ai/claude-agent-sdk`)
+
+Each adapter declares capabilities (image input, tool calls, thinking modes,
+etc.) and translates agent events into ACP notifications. The rivet sidecar
+spawns the adapter as a subprocess and speaks ACP over stdin/stdout.
+
+### Key insight from SuperHQ
+
+SuperHQ (`github.com/superhq-ai/superhq`, a sister project with almost
+identical architecture) demonstrates the full pattern:
+
+- Agent configs declare `InstallStep` pipelines (download Node.js, npm install
+  agent packages, write hook configs)
+- An auth gateway reverse-proxy intercepts outbound API requests, swapping
+  dummy keys (`sk-shuru-gateway`) for real credentials — agents never see the
+  real keys
+- The `claude-agent-acp` package handles image input in prompts, tool calls,
+  edit review diffs, thinking modes, and permission requests over ACP
+
+### Tasks
+
+| ID | Task | Crate(s) | Depends on | Parallel group |
+|---|---|---|---|---|
+| 9a | Make `SessionHost` agent type configurable (read from onboarding/config instead of hardcoded `"pi"`) | `cuartel-app` | 3l | A |
+| 9b | Add `@agentclientprotocol/claude-agent-acp` to rivet sidecar deps + `@rivet-dev/agent-os-core` `claude` agent config | `rivet/` | — | A |
+| 9c | Create `@rivet-dev/agent-os-claude` package (ACP adapter for Claude Agent SDK) or use upstream `claude-agent-acp` directly | `rivet/` | 9b | A |
+| 9d | Update `rivet/server.ts` to register both `pi` and `claude` agents with AgentOS | `rivet/` | 9b, 9c | A |
+| 9e | Add per-agent `models.json` overrides for the AgentOS VM: force Pi to use `anthropic` provider when `ANTHROPIC_API_KEY` is present | `rivet/` | 9d | B |
+| 9f | Update onboarding UI to show Claude Code as a harness option and persist the choice | `cuartel-app`, `cuartel-core` | 9a | B |
+| 9g | Auth gateway proof-of-concept: reverse proxy that injects API keys into outbound Anthropic/OpenAI requests | `cuartel-core` (new `auth_gateway.rs`) | 5a | C |
+
+### AgentOS agent configs (reference from agent-os-core)
+
+The `AGENT_CONFIGS` object in `@rivet-dev/agent-os-core/dist/agents.js` already
+defines entries for `pi`, `pi-cli`, `opencode`, and `claude`. The `claude`
+entry uses:
+
+```
+acpAdapter: "@rivet-dev/agent-os-claude"
+agentPackage: "@anthropic-ai/claude-agent-sdk"
+defaultEnv: { CLAUDE_AGENT_SDK_CLIENT_APP, CLAUDE_CODE_SIMPLE, ... }
+```
+
+### Pi provider configuration inside AgentOS VM
+
+The AgentOS VM runs isolated from the host filesystem. Pi's normal
+`~/.pi/agent/settings.json` (which may point to `google-antigravity`) is NOT
+available inside the VM. Two mechanisms ensure Pi uses the injected
+`ANTHROPIC_API_KEY`:
+
+1. **`extra_env()` on the harness** (`cuartel-core/src/agent.rs`):
+   `PiHarness::extra_env()` returns `PI_DEFAULT_PROVIDER=anthropic` and
+   `PI_DEFAULT_MODEL=claude-sonnet-4-20250514`. These override Pi's
+   `settings.json` defaults so the agent uses the Anthropic provider even if
+   the user's local Pi config points to a different one.
+
+2. **`createSession({ env })`** (`cuartel-app/src/session_host.rs`): The
+   credential-store env vars (including `ANTHROPIC_API_KEY` and the
+   `PI_DEFAULT_*` vars above) are passed through the `createSession` action's
+   `options.env` parameter. The AgentOS `createSession` method merges these
+   into `launchEnv` which becomes the spawned process's environment inside the
+   VM. Without this, the VM process has no API key and Pi crashes with
+   "Agent process exited".
+
+   Flow: `main.rs` builds `sidecar_env` → `CuartelApp` passes it to
+   `SessionHost::new` → `run_driver` passes it to
+   `client.create_session(agent_id, "pi", { env })` → rivetkit forwards to
+   `AgentOs.createSession(agentType, options)` → `launchEnv = { ...defaultEnv,
+   ...extraEnv, ...options.env }` → `kernel.spawn("node", [...],
+   { env: launchEnv })` → VM process inherits env vars.
+
+### npm `call-bind` symlink issue
+
+The `npm install` in `rivet/` can leave a broken hoisted directory at
+`node_modules/call-bind` (empty dir instead of a symlink or copy). This is a
+transitive dependency of `which-typed-array` (required by `@mariozechner/pi-ai`
+inside the VM). The AgentOS VM's esbuild bundler resolves module paths from
+`/root/node_modules/`, and the `call-bind` directory being empty causes a
+build-time crash:
+
+```
+✘ [ERROR] Could not resolve "call-bind"
+    node_modules/which-typed-array/index.js:5:23
+```
+
+**Fix**: if the top-level `node_modules/call-bind` is empty after `npm install`,
+copy the working copy from the nested location:
+
+```bash
+rm -rf rivet/node_modules/call-bind
+cp -r rivet/node_modules/@rivet-dev/agent-os-pi/node_modules/call-bind \
+      rivet/node_modules/call-bind
+```
+
+This should be added to the `rivet/postinstall.sh` script or checked in CI.
+
+---
+
 ## What to Build First
 
 Start with **Phase 1 + Phase 2** together: get a GPUI window with a working terminal and a running Rivet sidecar. This validates the entire stack end-to-end (Rust -> GPUI -> Metal rendering + Node.js sidecar -> Rivet AgentOS) before investing in features.

@@ -1,3 +1,4 @@
+use crate::onboarding_view::{OnboardingCompleted, OnboardingView};
 use crate::permission_prompt::{PendingPermission, PermissionDecision, PermissionPrompt};
 use crate::session_host::SessionHost;
 use crate::sidebar::{SessionItem, SessionSelected, Sidebar};
@@ -5,13 +6,17 @@ use crate::sidecar_host::SidecarStatus;
 use crate::theme::Theme;
 use crate::workspace::WorkspaceView;
 use chrono::{Duration as ChronoDuration, Utc};
-use cuartel_core::agent::AgentType;
+use cuartel_core::agent::{AgentType, HarnessRegistry};
+use cuartel_core::credential_store::CredentialStore;
+use cuartel_core::onboarding::OnboardingConfig;
 use cuartel_core::session::SessionState;
 use cuartel_rivet::client::RivetClient;
 use cuartel_terminal::TerminalView;
 use gpui::*;
 use parking_lot::Mutex;
 use serde_json::json;
+use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::runtime::Handle;
 
@@ -21,13 +26,22 @@ pub struct CuartelApp {
     #[allow(dead_code)]
     permission_prompt: Entity<PermissionPrompt>,
     session_host: Entity<SessionHost>,
+    onboarding_view: Option<Entity<OnboardingView>>,
+    onboarding_config: OnboardingConfig,
+    data_dir: PathBuf,
 }
 
 impl CuartelApp {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         sidecar_status: Arc<Mutex<SidecarStatus>>,
         rivet_client: Arc<Mutex<Option<RivetClient>>>,
         runtime_handle: Handle,
+        registry: Arc<HarnessRegistry>,
+        credentials: Arc<dyn CredentialStore>,
+        onboarding_config: OnboardingConfig,
+        data_dir: PathBuf,
+        sidecar_env: HashMap<String, String>,
         cx: &mut Context<Self>,
     ) -> Self {
         let fixtures = fixture_sessions();
@@ -66,7 +80,15 @@ impl CuartelApp {
         let workspace = cx.new({
             let permission_prompt = permission_prompt.clone();
             let terminal = terminal.clone();
-            |cx| WorkspaceView::new(initial_label, initial_agent, terminal, permission_prompt, cx)
+            |cx| {
+                WorkspaceView::new(
+                    initial_label,
+                    initial_agent,
+                    terminal,
+                    permission_prompt,
+                    cx,
+                )
+            }
         });
 
         let session_host = cx.new({
@@ -79,6 +101,7 @@ impl CuartelApp {
                     sidecar_status,
                     terminal,
                     permission_prompt,
+                    sidecar_env,
                     cx,
                 )
             }
@@ -88,12 +111,49 @@ impl CuartelApp {
         cx.subscribe(&permission_prompt, Self::on_permission_decision)
             .detach();
 
+        // Only show the onboarding modal on first run (until the user
+        // clicks "Save and continue"). After that it's dismissed for the
+        // rest of the session; surfacing it from settings is a Phase 3
+        // follow-up.
+        let onboarding_view = if !onboarding_config.completed {
+            let initial_default = onboarding_config.default_harness.clone();
+            let ov =
+                cx.new(move |cx| OnboardingView::new(registry, credentials, initial_default, cx));
+            cx.subscribe(&ov, Self::on_onboarding_completed).detach();
+            Some(ov)
+        } else {
+            None
+        };
+
         Self {
             sidebar,
             workspace,
             permission_prompt,
             session_host,
+            onboarding_view,
+            onboarding_config,
+            data_dir,
         }
+    }
+
+    fn on_onboarding_completed(
+        &mut self,
+        _view: Entity<OnboardingView>,
+        event: &OnboardingCompleted,
+        cx: &mut Context<Self>,
+    ) {
+        self.onboarding_config.default_harness = Some(event.default_harness.clone());
+        self.onboarding_config.completed = true;
+        if let Err(e) = self.onboarding_config.save(&self.data_dir) {
+            log::warn!("failed to persist onboarding config: {e}");
+        }
+        log::info!(
+            "onboarding completed: default_harness={:?} (restart cuartel to pick up \
+             sidecar env injection)",
+            self.onboarding_config.default_harness,
+        );
+        self.onboarding_view = None;
+        cx.notify();
     }
 
     fn on_session_selected(
@@ -131,12 +191,14 @@ impl Render for CuartelApp {
 
         div()
             .id("cuartel-root")
+            .relative()
             .flex()
             .size_full()
             .bg(rgb(theme.bg_primary))
             .font_family("IBM Plex Sans")
             .child(self.sidebar.clone())
             .child(self.workspace.clone())
+            .children(self.onboarding_view.clone())
     }
 }
 

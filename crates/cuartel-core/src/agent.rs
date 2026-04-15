@@ -153,6 +153,37 @@ pub trait AgentHarness: Send + Sync {
     /// them into the VM process.
     fn required_env_keys(&self) -> &'static [&'static str];
 
+    /// Stable identifier for the credential store: all harnesses that share
+    /// an upstream provider (Pi, Claude Code, OpenCode → Anthropic) look up
+    /// the same key so the user doesn't enter the same token twice. Returns
+    /// `"custom"` by default for harnesses that don't reuse a well-known
+    /// provider.
+    fn provider_id(&self) -> &'static str {
+        "custom"
+    }
+
+    /// Extra environment variables this harness needs beyond `required_env_keys`.
+    /// These are injected as static key=value pairs regardless of credential
+    /// store contents. Used for provider/model pinning (e.g. Pi needs
+    /// `PI_DEFAULT_PROVIDER=anthropic` to avoid falling back to an OAuth
+    /// provider the user configured locally).
+    fn extra_env(&self) -> Vec<(&str, String)> {
+        Vec::new()
+    }
+
+    /// Host binary to probe with `which`/`where` during availability
+    /// detection. Returning `None` disables the probe (useful for harnesses
+    /// that ship as a managed npm package rather than a CLI on PATH).
+    fn probe_program(&self) -> Option<&'static str> {
+        None
+    }
+
+    /// Human-readable instruction shown next to a `not installed` row in the
+    /// onboarding UI. Usually a copy-paste shell command.
+    fn install_hint(&self) -> &'static str {
+        ""
+    }
+
     /// Ordered steps to install the harness into a freshly booted VM.
     fn install_steps(&self) -> Vec<InstallStep>;
 
@@ -225,7 +256,20 @@ impl std::fmt::Debug for HarnessRegistry {
 /// maps onto `HarnessEvent`.
 pub struct PiHarness;
 
+/// Environment variables that Pi needs to function. `ANTHROPIC_API_KEY`
+/// is the credential; `PI_DEFAULT_PROVIDER` and `PI_DEFAULT_MODEL` force
+/// Pi to use the Anthropic API (not google-antigravity or another OAuth
+/// provider) so the injected key actually gets used.
 const PI_REQUIRED_ENV: &[&str] = &["ANTHROPIC_API_KEY"];
+
+/// Extra environment variables to inject when the Pi harness is selected.
+/// These override Pi's `settings.json` defaults so the agent uses the
+/// correct provider even if the user's local Pi config points to a
+/// different one (e.g. google-antigravity via OAuth).
+const PI_EXTRA_ENV: &[(&str, &str)] = &[
+    ("PI_DEFAULT_PROVIDER", "anthropic"),
+    ("PI_DEFAULT_MODEL", "claude-sonnet-4-20250514"),
+];
 
 impl AgentHarness for PiHarness {
     fn agent_type(&self) -> AgentType {
@@ -234,6 +278,25 @@ impl AgentHarness for PiHarness {
 
     fn required_env_keys(&self) -> &'static [&'static str] {
         PI_REQUIRED_ENV
+    }
+
+    fn provider_id(&self) -> &'static str {
+        "anthropic"
+    }
+
+    fn extra_env(&self) -> Vec<(&str, String)> {
+        PI_EXTRA_ENV
+            .iter()
+            .map(|(k, v)| (*k, (*v).to_string()))
+            .collect()
+    }
+
+    fn probe_program(&self) -> Option<&'static str> {
+        Some("pi")
+    }
+
+    fn install_hint(&self) -> &'static str {
+        "curl -fsSL https://pi.cuartel.dev/install.sh | sh"
     }
 
     fn install_steps(&self) -> Vec<InstallStep> {
@@ -281,8 +344,8 @@ impl AgentHarness for PiHarness {
         if trimmed.is_empty() {
             return Ok(None);
         }
-        let value: serde_json::Value = serde_json::from_str(trimmed)
-            .map_err(|e| HarnessError::ParseError(e.to_string()))?;
+        let value: serde_json::Value =
+            serde_json::from_str(trimmed).map_err(|e| HarnessError::ParseError(e.to_string()))?;
         let kind = value
             .get("type")
             .and_then(|v| v.as_str())
@@ -349,6 +412,18 @@ impl AgentHarness for ClaudeCodeHarness {
         CLAUDE_CODE_REQUIRED_ENV
     }
 
+    fn provider_id(&self) -> &'static str {
+        "anthropic"
+    }
+
+    fn probe_program(&self) -> Option<&'static str> {
+        Some("claude")
+    }
+
+    fn install_hint(&self) -> &'static str {
+        "npm install -g @anthropic-ai/claude-code"
+    }
+
     fn install_steps(&self) -> Vec<InstallStep> {
         vec![
             InstallStep {
@@ -395,8 +470,8 @@ impl AgentHarness for ClaudeCodeHarness {
         if trimmed.is_empty() {
             return Ok(None);
         }
-        let value: serde_json::Value = serde_json::from_str(trimmed)
-            .map_err(|e| HarnessError::ParseError(e.to_string()))?;
+        let value: serde_json::Value =
+            serde_json::from_str(trimmed).map_err(|e| HarnessError::ParseError(e.to_string()))?;
         let kind = value
             .get("type")
             .and_then(|v| v.as_str())
@@ -410,10 +485,7 @@ impl AgentHarness for ClaudeCodeHarness {
                 .and_then(|c| c.as_array())
                 .and_then(|blocks| blocks.iter().find_map(claude_code_block_to_event)),
             "result" => {
-                let subtype = value
-                    .get("subtype")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
+                let subtype = value.get("subtype").and_then(|v| v.as_str()).unwrap_or("");
                 if subtype == "success" {
                     Some(HarnessEvent::Completed)
                 } else {
@@ -481,6 +553,18 @@ impl AgentHarness for CodexHarness {
         CODEX_REQUIRED_ENV
     }
 
+    fn provider_id(&self) -> &'static str {
+        "openai"
+    }
+
+    fn probe_program(&self) -> Option<&'static str> {
+        Some("codex")
+    }
+
+    fn install_hint(&self) -> &'static str {
+        "npm install -g @openai/codex"
+    }
+
     fn install_steps(&self) -> Vec<InstallStep> {
         vec![
             InstallStep {
@@ -521,8 +605,8 @@ impl AgentHarness for CodexHarness {
         if trimmed.is_empty() {
             return Ok(None);
         }
-        let value: serde_json::Value = serde_json::from_str(trimmed)
-            .map_err(|e| HarnessError::ParseError(e.to_string()))?;
+        let value: serde_json::Value =
+            serde_json::from_str(trimmed).map_err(|e| HarnessError::ParseError(e.to_string()))?;
         let Some(msg) = value.get("msg") else {
             return Ok(None);
         };
@@ -585,6 +669,18 @@ impl AgentHarness for OpenCodeHarness {
         OPENCODE_REQUIRED_ENV
     }
 
+    fn provider_id(&self) -> &'static str {
+        "anthropic"
+    }
+
+    fn probe_program(&self) -> Option<&'static str> {
+        Some("opencode")
+    }
+
+    fn install_hint(&self) -> &'static str {
+        "curl -fsSL https://opencode.ai/install | bash"
+    }
+
     fn install_steps(&self) -> Vec<InstallStep> {
         // SECURITY: same `curl | sh` caveat as Pi — acceptable inside a
         // throwaway VM, re-audit if the install host ever changes.
@@ -626,8 +722,8 @@ impl AgentHarness for OpenCodeHarness {
         if trimmed.is_empty() {
             return Ok(None);
         }
-        let value: serde_json::Value = serde_json::from_str(trimmed)
-            .map_err(|e| HarnessError::ParseError(e.to_string()))?;
+        let value: serde_json::Value =
+            serde_json::from_str(trimmed).map_err(|e| HarnessError::ParseError(e.to_string()))?;
         let event = value
             .get("event")
             .and_then(|v| v.as_str())
@@ -812,9 +908,7 @@ mod tests {
 
     #[test]
     fn pi_parse_unknown_type_returns_parse_error() {
-        let err = PiHarness
-            .parse_line(r#"{"type":"bogus"}"#)
-            .unwrap_err();
+        let err = PiHarness.parse_line(r#"{"type":"bogus"}"#).unwrap_err();
         assert!(matches!(err, HarnessError::ParseError(_)));
     }
 
@@ -822,17 +916,13 @@ mod tests {
 
     #[test]
     fn claude_code_launch_requires_api_key() {
-        let err = ClaudeCodeHarness
-            .launch("hi", &HashMap::new())
-            .unwrap_err();
+        let err = ClaudeCodeHarness.launch("hi", &HashMap::new()).unwrap_err();
         assert!(matches!(err, HarnessError::MissingEnv(ref k) if k == "ANTHROPIC_API_KEY"));
     }
 
     #[test]
     fn claude_code_launch_builds_stream_json_command() {
-        let cmd = ClaudeCodeHarness
-            .launch("do it", &env_with_key())
-            .unwrap();
+        let cmd = ClaudeCodeHarness.launch("do it", &env_with_key()).unwrap();
         assert_eq!(cmd.program, "claude");
         assert_eq!(
             cmd.args,
@@ -863,10 +953,7 @@ mod tests {
         match ev {
             HarnessEvent::ToolUse { name, input } => {
                 assert_eq!(name, "Bash");
-                assert_eq!(
-                    input.get("command").and_then(|v| v.as_str()),
-                    Some("ls")
-                );
+                assert_eq!(input.get("command").and_then(|v| v.as_str()), Some("ls"));
             }
             other => panic!("expected ToolUse, got {other:?}"),
         }
@@ -910,7 +997,9 @@ mod tests {
     fn claude_code_install_steps_use_npm() {
         let steps = ClaudeCodeHarness.install_steps();
         assert_eq!(steps[0].command[0], "npm");
-        assert!(steps[0].command.contains(&"@anthropic-ai/claude-code".to_string()));
+        assert!(steps[0]
+            .command
+            .contains(&"@anthropic-ai/claude-code".to_string()));
     }
 
     // ----- Codex -----
@@ -942,18 +1031,13 @@ mod tests {
     #[test]
     fn codex_parse_exec_command_begin_is_tool_use() {
         let ev = CodexHarness
-            .parse_line(
-                r#"{"id":"2","msg":{"type":"exec_command_begin","command":["ls","-la"]}}"#,
-            )
+            .parse_line(r#"{"id":"2","msg":{"type":"exec_command_begin","command":["ls","-la"]}}"#)
             .unwrap()
             .unwrap();
         match ev {
             HarnessEvent::ToolUse { name, input } => {
                 assert_eq!(name, "exec");
-                assert_eq!(
-                    input.as_array().map(|a| a.len()),
-                    Some(2)
-                );
+                assert_eq!(input.as_array().map(|a| a.len()), Some(2));
             }
             other => panic!("expected ToolUse, got {other:?}"),
         }
@@ -987,10 +1071,7 @@ mod tests {
 
     #[test]
     fn codex_parse_envelope_without_msg_is_noop() {
-        assert!(CodexHarness
-            .parse_line(r#"{"id":"6"}"#)
-            .unwrap()
-            .is_none());
+        assert!(CodexHarness.parse_line(r#"{"id":"6"}"#).unwrap().is_none());
     }
 
     // ----- OpenCode -----
@@ -1003,9 +1084,7 @@ mod tests {
 
     #[test]
     fn opencode_launch_builds_run_json_command() {
-        let cmd = OpenCodeHarness
-            .launch("fix it", &env_with_key())
-            .unwrap();
+        let cmd = OpenCodeHarness.launch("fix it", &env_with_key()).unwrap();
         assert_eq!(cmd.program, "opencode");
         assert_eq!(cmd.args, vec!["run", "--json", "fix it"]);
     }

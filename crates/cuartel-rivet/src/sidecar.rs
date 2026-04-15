@@ -1,5 +1,6 @@
 use anyhow::{Result, anyhow};
 use log::{error, info};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::Stdio;
 use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader};
@@ -23,6 +24,11 @@ pub struct Sidecar {
     process: Option<Child>,
     rivet_dir: PathBuf,
     port: u16,
+    /// Extra environment variables to inject into the rivet sidecar
+    /// process. Phase 3l uses this to pass credential-store-backed API
+    /// keys (e.g. `ANTHROPIC_API_KEY`) down through the chain
+    /// `cuartel → rivetkit → agent-os Pi adapter subprocess`.
+    env: HashMap<String, String>,
 }
 
 impl Sidecar {
@@ -31,7 +37,19 @@ impl Sidecar {
             process: None,
             rivet_dir,
             port,
+            env: HashMap::new(),
         }
+    }
+
+    /// Replace the set of extra env vars forwarded to the sidecar process.
+    /// Called before `start()`; updates after the child is running are
+    /// ignored (you'd have to restart the sidecar for them to take effect).
+    pub fn set_env(&mut self, env: HashMap<String, String>) {
+        self.env = env;
+    }
+
+    pub fn env(&self) -> &HashMap<String, String> {
+        &self.env
     }
 
     pub async fn ensure_deps_installed(&self) -> Result<()> {
@@ -86,13 +104,20 @@ impl Sidecar {
         self.ensure_deps_installed().await?;
 
         info!("starting rivet sidecar on port {}...", self.port);
-        let mut child = Command::new("npx")
-            .args(["tsx", "server.ts"])
+        if !self.env.is_empty() {
+            let keys: Vec<&str> = self.env.keys().map(String::as_str).collect();
+            info!("injecting {} env var(s) into sidecar: {:?}", keys.len(), keys);
+        }
+        let mut cmd = Command::new("npx");
+        cmd.args(["tsx", "server.ts"])
             .current_dir(&self.rivet_dir)
             .env("PORT", self.port.to_string())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()?;
+            .stderr(Stdio::piped());
+        for (k, v) in &self.env {
+            cmd.env(k, v);
+        }
+        let mut child = cmd.spawn()?;
 
         if let Some(stdout) = child.stdout.take() {
             tokio::spawn(pipe_lines("rivet", stdout));

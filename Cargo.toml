@@ -34,6 +34,8 @@ dirs = "6"
 futures = "0.3"
 rust-embed = "8"
 base64 = "0.22"
+async-trait = "0.1"
+keyring = { version = "3", features = ["apple-native"] }
 
 cuartel-core = { path = "crates/cuartel-core" }
 cuartel-terminal = { path = "crates/cuartel-terminal" }

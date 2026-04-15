@@ -15,3 +15,8 @@ chrono = { workspace = true }
 log = { workspace = true }
 tokio = { workspace = true }
 dirs = { workspace = true }
+async-trait = { workspace = true }
+keyring = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"

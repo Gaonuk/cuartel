@@ -1,7 +1,10 @@
 pub mod agent;
 pub mod auth_gateway;
+pub mod availability;
 pub mod checkpoint;
 pub mod config;
+pub mod credential_store;
+pub mod onboarding;
 pub mod overlay;
 pub mod session;
 pub mod workspace;

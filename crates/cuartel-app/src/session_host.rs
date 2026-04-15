@@ -30,6 +30,8 @@ use cuartel_rivet::events::{
 use cuartel_terminal::TerminalView;
 use gpui::*;
 use parking_lot::Mutex;
+use serde_json::json;
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::runtime::Handle;
@@ -78,6 +80,7 @@ pub struct SessionHost {
     terminal: Entity<TerminalView>,
     permission_prompt: Entity<PermissionPrompt>,
     session: Session,
+    env: HashMap<String, String>,
     cmd_tx: UnboundedSender<SessionHostCommand>,
     _driver_task: Task<()>,
 }
@@ -89,16 +92,19 @@ impl SessionHost {
         sidecar_status: Arc<Mutex<SidecarStatus>>,
         terminal: Entity<TerminalView>,
         permission_prompt: Entity<PermissionPrompt>,
+        env: HashMap<String, String>,
         cx: &mut Context<Self>,
     ) -> Self {
         let (event_tx, event_rx) = mpsc::unbounded_channel::<SessionHostEvent>();
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<SessionHostCommand>();
 
+        let env_clone = env.clone();
         runtime.spawn(run_driver(
             client_slot,
             sidecar_status,
             event_tx,
             cmd_rx,
+            env_clone,
         ));
 
         let poll_task = cx.spawn(async move |this, cx| {
@@ -140,6 +146,7 @@ impl SessionHost {
                 SERVER_ID.into(),
                 AGENT_TYPE.into(),
             ),
+            env,
             cmd_tx,
             _driver_task: poll_task,
         }
@@ -224,6 +231,7 @@ async fn run_driver(
     sidecar_status: Arc<Mutex<SidecarStatus>>,
     event_tx: UnboundedSender<SessionHostEvent>,
     mut cmd_rx: UnboundedReceiver<SessionHostCommand>,
+    env: HashMap<String, String>,
 ) {
     let _ = event_tx.send(SessionHostEvent::Status("waiting for rivet sidecar...".into()));
 
@@ -282,7 +290,13 @@ async fn run_driver(
     };
 
     let _ = event_tx.send(SessionHostEvent::Status("creating pi session...".into()));
-    let session_rec = match client.create_session(&actor_id, AGENT_TYPE, None).await {
+    let session_options = if env.is_empty() {
+        None
+    } else {
+        log::info!("[session] createSession env: {:?}", env);
+        Some(json!({ "env": env }))
+    };
+    let session_rec = match client.create_session(&actor_id, AGENT_TYPE, session_options).await {
         Ok(r) => {
             let _ = event_tx.send(SessionHostEvent::Status(format!(
                 "session ready: {}",
