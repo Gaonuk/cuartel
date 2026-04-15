@@ -6,6 +6,7 @@ pub mod config;
 pub mod credential_store;
 pub mod diff_render;
 pub mod onboarding;
+pub mod sqlite_credential_store;
 pub mod overlay;
 pub mod session;
 pub mod workspace;
