@@ -1,8 +1,10 @@
+pub mod checkpoints;
 pub mod client;
 pub mod event_decode;
 pub mod events;
 pub mod sidecar;
 
+pub use checkpoints::{CheckpointRecord, CreateCheckpointOptions, RestoreCheckpointOptions};
 pub use client::{
     Actor, GetOrCreateRequest, GetOrCreateResult, Health, PromptResult, RivetClient,
     SessionInfo, SessionRecord,
