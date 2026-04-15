@@ -2,12 +2,17 @@ pub mod checkpoints;
 pub mod client;
 pub mod event_decode;
 pub mod events;
+pub mod filesystem;
 pub mod sidecar;
 
 pub use checkpoints::{CheckpointRecord, CreateCheckpointOptions, RestoreCheckpointOptions};
 pub use client::{
     Actor, GetOrCreateRequest, GetOrCreateResult, Health, PromptResult, RivetClient,
     SessionInfo, SessionRecord,
+};
+pub use filesystem::{
+    BatchReadResult, BatchWriteEntry, BatchWriteResult, DeleteOptions, DirEntry, EntryType,
+    FileBytes, MkdirOptions, ReaddirRecursiveOptions, VirtualStat,
 };
 pub use event_decode::{
     decode_bytes_envelope, extract_session_update_text, summarize_permission,
