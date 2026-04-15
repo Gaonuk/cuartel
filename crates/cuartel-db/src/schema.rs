@@ -19,10 +19,16 @@ pub fn run_migrations(conn: &Connection) -> Result<()> {
         CREATE TABLE IF NOT EXISTS credentials (
             id TEXT PRIMARY KEY,
             provider TEXT NOT NULL,
+            env_key TEXT NOT NULL,
             encrypted_value BLOB NOT NULL,
             nonce BLOB NOT NULL,
-            created_at TEXT NOT NULL DEFAULT (datetime('now'))
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+            UNIQUE(provider, env_key)
         );
+
+        CREATE INDEX IF NOT EXISTS credentials_provider_idx
+            ON credentials(provider);
 
         CREATE TABLE IF NOT EXISTS servers (
             id TEXT PRIMARY KEY,
