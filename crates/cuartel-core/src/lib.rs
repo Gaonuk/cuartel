@@ -4,6 +4,7 @@ pub mod availability;
 pub mod checkpoint;
 pub mod config;
 pub mod credential_store;
+pub mod diff_render;
 pub mod onboarding;
 pub mod overlay;
 pub mod session;

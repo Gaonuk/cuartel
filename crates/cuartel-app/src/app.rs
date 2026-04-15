@@ -1,3 +1,4 @@
+use crate::diff_view::{fixture_diffs, DiffView};
 use crate::onboarding_view::{OnboardingCompleted, OnboardingView};
 use crate::permission_prompt::{PermissionDecision, PermissionPrompt};
 use crate::session_host::{SessionHost, SessionStateChange};
@@ -59,14 +60,20 @@ impl CuartelApp {
 
         let permission_prompt = cx.new(|cx| PermissionPrompt::new(cx));
 
+        // 4c: review panel mounts against fixture diffs until 4f wires it
+        // to a live overlay snapshot from the running session.
+        let diff_view = cx.new(|cx| DiffView::new(fixture_diffs(), cx));
+
         let workspace = cx.new({
             let permission_prompt = permission_prompt.clone();
             let terminal = terminal.clone();
+            let diff_view = diff_view.clone();
             |cx| {
                 WorkspaceView::new(
                     SharedString::from(SESSION_LABEL),
                     SharedString::from(SESSION_AGENT.display_name()),
                     terminal,
+                    diff_view,
                     permission_prompt,
                     cx,
                 )
