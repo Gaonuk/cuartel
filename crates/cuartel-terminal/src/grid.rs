@@ -20,6 +20,7 @@ use vte::{Params, Parser, Perform};
 pub enum Color {
     Default,
     Indexed(u8),
+    Rgb(u8, u8, u8),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -306,19 +307,37 @@ fn apply_sgr(style: &mut CellStyle, params: &Params) {
             100..=107 => style.bg = Color::Indexed((code - 100 + 8) as u8),
             38 => {
                 if let Some(next) = iter.next() {
-                    if next.first().copied() == Some(5) {
-                        if let Some(idx) = iter.next().and_then(|s| s.first().copied()) {
-                            style.fg = Color::Indexed(idx as u8);
+                    match next.first().copied() {
+                        Some(5) => {
+                            if let Some(idx) = iter.next().and_then(|s| s.first().copied()) {
+                                style.fg = Color::Indexed(idx as u8);
+                            }
                         }
+                        Some(2) => {
+                            let r = iter.next().and_then(|s| s.first().copied()).unwrap_or(0) as u8;
+                            let g = iter.next().and_then(|s| s.first().copied()).unwrap_or(0) as u8;
+                            let b = iter.next().and_then(|s| s.first().copied()).unwrap_or(0) as u8;
+                            style.fg = Color::Rgb(r, g, b);
+                        }
+                        _ => {}
                     }
                 }
             }
             48 => {
                 if let Some(next) = iter.next() {
-                    if next.first().copied() == Some(5) {
-                        if let Some(idx) = iter.next().and_then(|s| s.first().copied()) {
-                            style.bg = Color::Indexed(idx as u8);
+                    match next.first().copied() {
+                        Some(5) => {
+                            if let Some(idx) = iter.next().and_then(|s| s.first().copied()) {
+                                style.bg = Color::Indexed(idx as u8);
+                            }
                         }
+                        Some(2) => {
+                            let r = iter.next().and_then(|s| s.first().copied()).unwrap_or(0) as u8;
+                            let g = iter.next().and_then(|s| s.first().copied()).unwrap_or(0) as u8;
+                            let b = iter.next().and_then(|s| s.first().copied()).unwrap_or(0) as u8;
+                            style.bg = Color::Rgb(r, g, b);
+                        }
+                        _ => {}
                     }
                 }
             }
