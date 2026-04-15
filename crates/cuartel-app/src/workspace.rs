@@ -1,3 +1,4 @@
+use crate::diff_view::DiffView;
 use crate::permission_prompt::PermissionPrompt;
 use crate::theme::Theme;
 use cuartel_core::session::SessionState;
@@ -12,13 +13,21 @@ pub struct PromptSubmitted {
 
 impl EventEmitter<PromptSubmitted> for WorkspaceView {}
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WorkspaceTab {
+    Terminal,
+    Review,
+}
+
 pub struct WorkspaceView {
     terminal: Entity<TerminalView>,
+    diff_view: Entity<DiffView>,
     permission_prompt: Entity<PermissionPrompt>,
     label: SharedString,
     agent: SharedString,
     prompt_text: String,
     session_state: SessionState,
+    active_tab: WorkspaceTab,
     focus_handle: FocusHandle,
     _observer: Subscription,
 }
@@ -28,6 +37,7 @@ impl WorkspaceView {
         label: impl Into<SharedString>,
         agent: impl Into<SharedString>,
         terminal: Entity<TerminalView>,
+        diff_view: Entity<DiffView>,
         permission_prompt: Entity<PermissionPrompt>,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -35,14 +45,24 @@ impl WorkspaceView {
         let focus_handle = cx.focus_handle();
         Self {
             terminal,
+            diff_view,
             permission_prompt,
             label: label.into(),
             agent: agent.into(),
             prompt_text: String::new(),
             session_state: SessionState::Created,
+            active_tab: WorkspaceTab::Terminal,
             focus_handle,
             _observer: observer,
         }
+    }
+
+    fn set_tab(&mut self, tab: WorkspaceTab, cx: &mut Context<Self>) {
+        if self.active_tab == tab {
+            return;
+        }
+        self.active_tab = tab;
+        cx.notify();
     }
 
     pub fn set_active_session(
@@ -142,6 +162,56 @@ impl Render for WorkspaceView {
 
         window.focus(&self.focus_handle);
 
+        let active_tab = self.active_tab;
+        let review_count = self.diff_view.read(cx).len();
+        let review_label = if review_count > 0 {
+            SharedString::from(format!("Review ({review_count})"))
+        } else {
+            SharedString::from("Review")
+        };
+
+        let tab_button = |id: &'static str,
+                          label: SharedString,
+                          tab: WorkspaceTab,
+                          theme: &Theme,
+                          cx: &mut Context<Self>| {
+            let active = active_tab == tab;
+            let bg = if active { theme.bg_primary } else { theme.bg_secondary };
+            let fg = if active { theme.text_primary } else { theme.text_muted };
+            let border = if active { theme.accent } else { theme.bg_secondary };
+            div()
+                .id(id)
+                .px_3()
+                .py_1()
+                .rounded_md()
+                .bg(rgb(bg))
+                .border_b_2()
+                .border_color(rgb(border))
+                .text_sm()
+                .font_weight(if active {
+                    FontWeight::SEMIBOLD
+                } else {
+                    FontWeight::NORMAL
+                })
+                .text_color(rgb(fg))
+                .cursor_pointer()
+                .hover(|s| s.bg(rgb(theme.bg_hover)))
+                .on_click(cx.listener(move |this, _evt, _win, cx| this.set_tab(tab, cx)))
+                .child(label)
+        };
+
+        let body: AnyElement = match self.active_tab {
+            WorkspaceTab::Terminal => div()
+                .flex_1()
+                .child(self.terminal.clone())
+                .into_any_element(),
+            WorkspaceTab::Review => div()
+                .flex_1()
+                .min_h_0()
+                .child(self.diff_view.clone())
+                .into_any_element(),
+        };
+
         div()
             .id("workspace")
             .flex()
@@ -153,6 +223,7 @@ impl Render for WorkspaceView {
                 div()
                     .flex()
                     .items_center()
+                    .gap_2()
                     .h(px(36.0))
                     .bg(rgb(theme.bg_secondary))
                     .border_b_1()
@@ -180,10 +251,32 @@ impl Render for WorkspaceView {
                                     .text_color(rgb(theme.text_muted))
                                     .child(self.agent.clone()),
                             ),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap_1()
+                            .ml_2()
+                            .child(tab_button(
+                                "tab-terminal",
+                                "Terminal".into(),
+                                WorkspaceTab::Terminal,
+                                &theme,
+                                cx,
+                            ))
+                            .child(tab_button(
+                                "tab-review",
+                                review_label,
+                                WorkspaceTab::Review,
+                                &theme,
+                                cx,
+                            )),
                     ),
             )
             .children(show_prompt.then(|| self.permission_prompt.clone()))
-            .child(div().flex_1().child(self.terminal.clone()))
+            .child(body)
             .child(
                 div()
                     .id("prompt-bar")

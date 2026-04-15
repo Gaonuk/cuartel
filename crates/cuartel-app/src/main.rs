@@ -1,5 +1,6 @@
 mod app;
 mod assets;
+mod diff_view;
 mod onboarding_view;
 mod permission_prompt;
 mod session_host;
