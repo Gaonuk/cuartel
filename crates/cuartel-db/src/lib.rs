@@ -2,6 +2,7 @@ pub mod checkpoints;
 pub mod credentials;
 pub mod crypto;
 pub mod schema;
+pub mod servers;
 pub mod workspaces;
 
 use anyhow::Result;

@@ -1,9 +1,10 @@
 use crate::diff_view::{fixture_diffs, DiffView, ReviewApply};
 use crate::onboarding_view::{OnboardingCompleted, OnboardingView};
 use crate::permission_prompt::{PermissionDecision, PermissionPrompt};
+use crate::server_registry_host::ServerRegistryHost;
 use crate::session_host::{SessionHost, SessionHostConfig, SessionStateChange};
 use crate::settings_view::{SettingsDismissed, SettingsView};
-use crate::sidebar::{SessionItem, SessionSelected, SettingsRequested, Sidebar};
+use crate::sidebar::{ServerSelected, SessionItem, SessionSelected, SettingsRequested, Sidebar};
 use crate::sidecar_host::SidecarStatus;
 use crate::tab_bar::{NewTabRequested, TabBar, TabCloseRequested, TabInfo, TabSelected};
 use crate::theme::Theme;
@@ -15,6 +16,7 @@ use cuartel_core::credential_store::CredentialStore;
 use cuartel_core::onboarding::OnboardingConfig;
 use cuartel_core::review;
 use cuartel_core::session::SessionState;
+use cuartel_remote::ServerRegistry;
 use cuartel_rivet::client::RivetClient;
 use cuartel_terminal::TerminalView;
 use gpui::*;
@@ -58,6 +60,10 @@ pub struct CuartelApp {
     onboarding_config: OnboardingConfig,
     data_dir: PathBuf,
     workspace_path: Option<PathBuf>,
+    server_registry: Option<Arc<ServerRegistry>>,
+    _server_registry_host: Option<ServerRegistryHost>,
+    #[allow(dead_code)] // Read by 7e session routing.
+    active_server_id: String,
 }
 
 impl CuartelApp {
@@ -71,9 +77,16 @@ impl CuartelApp {
         onboarding_config: OnboardingConfig,
         data_dir: PathBuf,
         sidecar_env: HashMap<String, String>,
+        server_registry: Option<Arc<ServerRegistry>>,
         cx: &mut Context<Self>,
     ) -> Self {
-        let sidebar = cx.new(|cx| Sidebar::new(sidecar_status.clone(), cx));
+        let server_registry_host = server_registry
+            .as_ref()
+            .map(|reg| ServerRegistryHost::spawn(runtime_handle.clone(), reg.clone()));
+        let server_state = server_registry_host.as_ref().map(|h| h.state());
+
+        let sidebar_state = server_state.clone();
+        let sidebar = cx.new(|cx| Sidebar::new(sidecar_status.clone(), sidebar_state, cx));
 
         let tab_bar = cx.new(|cx| TabBar::new(cx));
 
@@ -158,6 +171,7 @@ impl CuartelApp {
 
         cx.subscribe(&sidebar, Self::on_session_selected).detach();
         cx.subscribe(&sidebar, Self::on_settings_requested).detach();
+        cx.subscribe(&sidebar, Self::on_server_selected).detach();
         cx.subscribe(&workspace, Self::on_prompt_submitted).detach();
         cx.subscribe(&workspace, Self::on_review_apply).detach();
         cx.subscribe(&workspace, Self::on_checkpoint_restore).detach();
@@ -197,6 +211,9 @@ impl CuartelApp {
             onboarding_config,
             data_dir,
             workspace_path: None,
+            server_registry,
+            _server_registry_host: server_registry_host,
+            active_server_id: cuartel_db::servers::LOCAL_SERVER_ID.to_string(),
         }
     }
 
@@ -441,6 +458,31 @@ impl CuartelApp {
     ) {
         if let Some(idx) = self.find_slot_idx(&event.id) {
             self.switch_to(idx, cx);
+        }
+    }
+
+    fn on_server_selected(
+        &mut self,
+        sidebar: Entity<Sidebar>,
+        event: &ServerSelected,
+        cx: &mut Context<Self>,
+    ) {
+        // Phase 7 only tracks the "active" server — 7e wires it into
+        // session routing. Ignore clicks on a server we don't know about.
+        let known = self
+            .server_registry
+            .as_ref()
+            .and_then(|r| r.get(&event.id).ok().flatten());
+        if let Some(server) = known {
+            self.active_server_id = server.id.clone();
+            sidebar.update(cx, |sb, cx| {
+                sb.set_active_server(Some(server.id.clone()), cx);
+            });
+            log::info!(
+                "[server] active server set to {} ({})",
+                server.name,
+                server.address
+            );
         }
     }
 

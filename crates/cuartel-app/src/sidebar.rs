@@ -1,3 +1,6 @@
+use crate::sidebar_visuals::{
+    describe_sidecar, relative_time, server_visuals, status_visuals,
+};
 use crate::sidecar_host::SidecarStatus;
 use crate::theme::Theme;
 use chrono::{DateTime, Utc};
@@ -21,16 +24,27 @@ pub struct SessionSelected {
 #[derive(Clone, Debug)]
 pub struct SettingsRequested;
 
+/// User clicked a server entry in the sidebar. The parent uses this to
+/// mark the server as "active" (phase 7e will route new sessions to it).
+#[derive(Clone, Debug)]
+#[allow(dead_code)]
+pub struct ServerSelected {
+    pub id: String,
+}
+
 pub struct Sidebar {
     sessions: Vec<SessionItem>,
     selected_index: Option<usize>,
     sidecar_status: Arc<Mutex<SidecarStatus>>,
     last_seen_status: SidecarStatus,
+    servers: Vec<ServerItem>,
+    active_server_id: Option<String>,
     _poll_task: Task<()>,
 }
 
 impl EventEmitter<SessionSelected> for Sidebar {}
 impl EventEmitter<SettingsRequested> for Sidebar {}
+impl EventEmitter<ServerSelected> for Sidebar {}
 
 #[derive(Clone)]
 pub struct SessionItem {
@@ -63,23 +77,42 @@ impl SessionItem {
     }
 }
 
+/// One row in the SERVERS section. Covers both the local sidecar
+/// (status streamed from `SidecarStatus`) and remote registered peers
+/// (reachability polled from cuartel-remote).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ServerItem {
+    pub id: SharedString,
+    pub name: SharedString,
+    pub address: SharedString,
+    pub tailscale_ip: Option<SharedString>,
+    pub is_local: bool,
+    pub reachable: Option<bool>,
+}
+
 impl Sidebar {
     pub fn new(
         sidecar_status: Arc<Mutex<SidecarStatus>>,
+        server_state: Option<Arc<Mutex<Vec<ServerItem>>>>,
         cx: &mut Context<Self>,
     ) -> Self {
         let status_poll = sidecar_status.clone();
+        let server_poll = server_state.clone();
         let poll_task = cx.spawn(async move |this, cx| {
             loop {
                 cx.background_executor()
                     .timer(Duration::from_millis(500))
                     .await;
                 let current = status_poll.lock().clone();
+                let latest_servers = server_poll.as_ref().map(|s| s.lock().clone());
                 if this
                     .update(cx, |sidebar, cx| {
                         if sidebar.last_seen_status != current {
                             sidebar.last_seen_status = current;
                             cx.notify();
+                        }
+                        if let Some(servers) = latest_servers {
+                            sidebar.set_servers(servers, cx);
                         }
                     })
                     .is_err()
@@ -89,12 +122,18 @@ impl Sidebar {
             }
         });
 
-        let initial = sidecar_status.lock().clone();
+        let initial_status = sidecar_status.lock().clone();
+        let initial_servers = server_state
+            .as_ref()
+            .map(|s| s.lock().clone())
+            .unwrap_or_default();
         Self {
             sessions: vec![],
             selected_index: None,
-            last_seen_status: initial,
+            last_seen_status: initial_status,
             sidecar_status,
+            servers: initial_servers,
+            active_server_id: None,
             _poll_task: poll_task,
         }
     }
@@ -105,6 +144,21 @@ impl Sidebar {
             self.selected_index = Some(0);
         }
         cx.notify();
+    }
+
+    pub fn set_servers(&mut self, items: Vec<ServerItem>, cx: &mut Context<Self>) {
+        if self.servers != items {
+            self.servers = items;
+            cx.notify();
+        }
+    }
+
+    #[allow(dead_code)]
+    pub fn set_active_server(&mut self, id: Option<String>, cx: &mut Context<Self>) {
+        if self.active_server_id != id {
+            self.active_server_id = id;
+            cx.notify();
+        }
     }
 
     fn select(&mut self, index: usize, cx: &mut Context<Self>) {
@@ -121,6 +175,16 @@ impl Sidebar {
             label: item.label.clone(),
             agent: SharedString::from(item.agent.display_name().to_string()),
         });
+        cx.notify();
+    }
+
+    fn select_server(&mut self, id: SharedString, cx: &mut Context<Self>) {
+        let id_str = id.to_string();
+        if self.active_server_id.as_deref() == Some(&id_str) {
+            return;
+        }
+        self.active_server_id = Some(id_str.clone());
+        cx.emit(ServerSelected { id: id_str });
         cx.notify();
     }
 }
@@ -191,55 +255,7 @@ impl Render for Sidebar {
                     .py_1()
                     .children(rows)
             })
-            .child(
-                // Footer - servers section
-                div()
-                    .flex()
-                    .flex_col()
-                    .border_t_1()
-                    .border_color(rgb(theme.border))
-                    .px_3()
-                    .py_2()
-                    .child(
-                        div()
-                            .text_xs()
-                            .font_weight(FontWeight::BOLD)
-                            .text_color(rgb(theme.text_muted))
-                            .child("SERVERS"),
-                    )
-                    .child({
-                        let status = self.sidecar_status.lock().clone();
-                        let (dot_color, label, sub) = describe_sidecar(&status, &theme);
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap_2()
-                            .py_1()
-                            .child(
-                                div()
-                                    .size(px(6.0))
-                                    .rounded_full()
-                                    .bg(rgb(dot_color)),
-                            )
-                            .child(
-                                div()
-                                    .flex()
-                                    .flex_col()
-                                    .child(
-                                        div()
-                                            .text_sm()
-                                            .text_color(rgb(theme.text_secondary))
-                                            .child(label),
-                                    )
-                                    .child(
-                                        div()
-                                            .text_xs()
-                                            .text_color(rgb(theme.text_muted))
-                                            .child(sub),
-                                    ),
-                            )
-                    }),
-            )
+            .child(self.render_servers_section(&theme, cx))
             .child(
                 // Settings button
                 div()
@@ -354,83 +370,177 @@ impl Sidebar {
             )
             .into_any_element()
     }
-}
 
-/// Map a `SessionState` onto a (dot color, short status label).
-fn status_visuals(state: &SessionState, theme: &Theme) -> (u32, SharedString) {
-    match state {
-        SessionState::Created => (theme.text_muted, "new".into()),
-        SessionState::Booting => (theme.warning, "booting".into()),
-        SessionState::Ready => (theme.success, "ready".into()),
-        SessionState::Running => (theme.accent, "running".into()),
-        SessionState::Paused => (theme.warning, "paused".into()),
-        SessionState::Checkpointed => (theme.text_muted, "checkpointed".into()),
-        SessionState::Forked => (theme.accent, "forked".into()),
-        SessionState::Reviewing => (theme.warning, "review".into()),
-        SessionState::Error(msg) => (
-            theme.error,
-            SharedString::from(format!("error: {}", truncate(msg, 24))),
-        ),
-        SessionState::Destroyed => (theme.text_muted, "destroyed".into()),
+    fn render_servers_section(
+        &self,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let sidecar_status = self.sidecar_status.lock().clone();
+        let active_id = self.active_server_id.clone();
+        let rows: Vec<AnyElement> = self
+            .servers
+            .iter()
+            .map(|item| {
+                self.render_server_row(
+                    item,
+                    &sidecar_status,
+                    active_id.as_deref() == Some(&item.id),
+                    theme,
+                    cx,
+                )
+            })
+            .collect();
+
+        // Fallback: when the registry hasn't populated yet (very first
+        // paint), render the live local sidecar status so the UI is never
+        // empty. Once set_servers is called this branch no longer runs.
+        let fallback = if self.servers.is_empty() {
+            Some(self.render_local_fallback(&sidecar_status, theme))
+        } else {
+            None
+        };
+
+        div()
+            .id("servers-section")
+            .flex()
+            .flex_col()
+            .border_t_1()
+            .border_color(rgb(theme.border))
+            .px_3()
+            .py_2()
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .child(
+                        div()
+                            .text_xs()
+                            .font_weight(FontWeight::BOLD)
+                            .text_color(rgb(theme.text_muted))
+                            .child("SERVERS"),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(theme.text_muted))
+                            .child(format!("{}", self.servers.len().max(1))),
+                    ),
+            )
+            .children(rows)
+            .children(fallback)
+            .into_any_element()
+    }
+
+    fn render_server_row(
+        &self,
+        item: &ServerItem,
+        sidecar_status: &SidecarStatus,
+        is_active: bool,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let (dot_color, subline) = server_visuals(item, sidecar_status, theme);
+        let bg = if is_active { theme.bg_active } else { theme.bg_sidebar };
+        let hover_bg = if is_active { theme.bg_active } else { theme.bg_hover };
+        let id = item.id.clone();
+        let row_id = ElementId::Name(format!("server-{}", item.id).into());
+
+        div()
+            .id(row_id)
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_2()
+            .py_1()
+            .px_1()
+            .rounded_md()
+            .bg(rgb(bg))
+            .hover(move |s| s.bg(rgb(hover_bg)))
+            .cursor_pointer()
+            .on_click(cx.listener(move |this, _evt, _win, cx| {
+                this.select_server(id.clone(), cx);
+            }))
+            .child(
+                div()
+                    .flex()
+                    .flex_none()
+                    .w(px(12.0))
+                    .justify_center()
+                    .child(
+                        div()
+                            .size(px(6.0))
+                            .rounded_full()
+                            .bg(rgb(dot_color)),
+                    ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .flex_1()
+                    .min_w_0()
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(rgb(theme.text_secondary))
+                            .font_weight(if is_active {
+                                FontWeight::SEMIBOLD
+                            } else {
+                                FontWeight::NORMAL
+                            })
+                            .overflow_hidden()
+                            .text_ellipsis()
+                            .child(item.name.clone()),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(theme.text_muted))
+                            .overflow_hidden()
+                            .text_ellipsis()
+                            .child(subline),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    fn render_local_fallback(
+        &self,
+        status: &SidecarStatus,
+        theme: &Theme,
+    ) -> AnyElement {
+        let (dot_color, label, sub) = describe_sidecar(status, theme);
+        div()
+            .flex()
+            .items_center()
+            .gap_2()
+            .py_1()
+            .child(
+                div()
+                    .size(px(6.0))
+                    .rounded_full()
+                    .bg(rgb(dot_color)),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(rgb(theme.text_secondary))
+                            .child(label),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(theme.text_muted))
+                            .child(sub),
+                    ),
+            )
+            .into_any_element()
     }
 }
 
-fn truncate(s: &str, n: usize) -> String {
-    if s.chars().count() <= n {
-        s.to_string()
-    } else {
-        let mut out: String = s.chars().take(n.saturating_sub(1)).collect();
-        out.push('…');
-        out
-    }
-}
-
-fn relative_time(now: DateTime<Utc>, then: DateTime<Utc>) -> SharedString {
-    let dur = now.signed_duration_since(then);
-    let secs = dur.num_seconds().max(0);
-    let out = if secs < 5 {
-        "just now".to_string()
-    } else if secs < 60 {
-        format!("{secs}s ago")
-    } else if secs < 3600 {
-        format!("{}m ago", secs / 60)
-    } else if secs < 86_400 {
-        format!("{}h ago", secs / 3600)
-    } else {
-        format!("{}d ago", secs / 86_400)
-    };
-    SharedString::from(out)
-}
-
-fn describe_sidecar(
-    status: &SidecarStatus,
-    theme: &Theme,
-) -> (u32, SharedString, SharedString) {
-    match status {
-        SidecarStatus::Idle => (
-            theme.text_muted,
-            "This Mac (local)".into(),
-            "sidecar idle".into(),
-        ),
-        SidecarStatus::Installing => (
-            theme.warning,
-            "This Mac (local)".into(),
-            "installing deps…".into(),
-        ),
-        SidecarStatus::Starting => (
-            theme.warning,
-            "This Mac (local)".into(),
-            "starting rivet…".into(),
-        ),
-        SidecarStatus::Ready => (
-            theme.success,
-            "This Mac (local)".into(),
-            "rivet ready on :6420".into(),
-        ),
-        SidecarStatus::Failed(msg) => (
-            theme.error,
-            "This Mac (local)".into(),
-            SharedString::from(format!("sidecar failed: {msg}")),
-        ),
-    }
-}
