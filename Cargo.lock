@@ -1397,6 +1397,7 @@ name = "cuartel-remote"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "cuartel-db",
  "cuartel-rivet",
  "log",
  "reqwest",

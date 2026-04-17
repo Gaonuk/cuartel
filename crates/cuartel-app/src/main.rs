@@ -3,9 +3,11 @@ mod assets;
 mod diff_view;
 mod onboarding_view;
 mod permission_prompt;
+mod server_registry_host;
 mod session_host;
 mod settings_view;
 mod sidebar;
+mod sidebar_visuals;
 mod sidecar_host;
 mod tab_bar;
 mod theme;
@@ -20,10 +22,12 @@ use cuartel_core::credential_store::{
     env_for_harness, CredentialStore, KeychainCredentialStore, MemoryCredentialStore,
 };
 use cuartel_core::onboarding::OnboardingConfig;
+use cuartel_db::Database;
+use cuartel_remote::{local_base_url, ServerRegistry, TailscaleClient};
 use gpui::*;
 use sidecar_host::{default_rivet_dir, SidecarHost};
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 
 const RIVET_PORT: u16 = 6420;
 
@@ -66,11 +70,24 @@ fn main() {
         sidecar_env.clone(),
     )));
 
+    // Phase 7: persistent server registry backed by the same SQLite DB the
+    // rest of the app will eventually share. Falls back to "no registry" on
+    // IO failure so the app still boots — the sidebar will render the live
+    // sidecar status like it did pre-phase-7.
+    let server_registry = match build_server_registry(&data_dir, RIVET_PORT) {
+        Ok(reg) => Some(Arc::new(reg)),
+        Err(e) => {
+            log::warn!("server registry unavailable ({e}); continuing without it");
+            None
+        }
+    };
+
     let registry_for_app = registry.clone();
     let credentials_for_app = credentials.clone();
     let onboarding_for_app = onboarding.clone();
     let data_dir_for_app = data_dir.clone();
     let env_for_app = sidecar_env;
+    let server_registry_for_app = server_registry.clone();
 
     Application::new()
         .with_assets(Assets)
@@ -87,6 +104,7 @@ fn main() {
             let credentials = credentials_for_app.clone();
             let onboarding = onboarding_for_app.clone();
             let data_dir = data_dir_for_app.clone();
+            let server_registry = server_registry_for_app.clone();
             cx.open_window(
                 WindowOptions {
                     window_bounds: Some(WindowBounds::Windowed(bounds)),
@@ -107,6 +125,7 @@ fn main() {
                             onboarding,
                             data_dir,
                             env_for_app,
+                            server_registry,
                             cx,
                         )
                     })
@@ -114,6 +133,24 @@ fn main() {
             )
             .unwrap();
         });
+}
+
+/// Open the shared SQLite DB and seed the `local` row so the sidebar has
+/// something to render on the very first launch.
+fn build_server_registry(
+    data_dir: &std::path::Path,
+    rivet_port: u16,
+) -> anyhow::Result<ServerRegistry> {
+    let db_path = data_dir.join("cuartel.db");
+    if let Some(parent) = db_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let db = Database::open(&db_path)?;
+    let db = Arc::new(StdMutex::new(db));
+    let tailscale = Arc::new(TailscaleClient::new());
+    let registry = ServerRegistry::new(db, tailscale);
+    registry.ensure_local(&local_base_url(rivet_port))?;
+    Ok(registry)
 }
 
 /// Build a credential store. Prefers the system keychain (task 3k) but
