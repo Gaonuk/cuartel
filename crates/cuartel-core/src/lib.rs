@@ -8,6 +8,7 @@ pub mod diff_render;
 pub mod onboarding;
 pub mod sqlite_credential_store;
 pub mod overlay;
+pub mod review;
 pub mod session;
 pub mod workspace;
 pub mod workspace_mount;
