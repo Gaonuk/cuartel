@@ -141,6 +141,29 @@ pub fn run_migrations(conn: &Connection) -> Result<()> {
 
         CREATE INDEX IF NOT EXISTS port_forwards_session_idx
             ON port_forwards(session_id);
+
+        CREATE TABLE IF NOT EXISTS audit_events (
+            id TEXT PRIMARY KEY,
+            kind TEXT NOT NULL,
+            timestamp TEXT NOT NULL,
+            hostname TEXT NOT NULL,
+            provider_id TEXT,
+            env_key TEXT,
+            method TEXT,
+            path TEXT,
+            status INTEGER,
+            client_ip TEXT,
+            reason TEXT,
+            error TEXT,
+            created_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+
+        CREATE INDEX IF NOT EXISTS audit_events_timestamp_idx
+            ON audit_events(timestamp DESC);
+        CREATE INDEX IF NOT EXISTS audit_events_kind_idx
+            ON audit_events(kind);
+        CREATE INDEX IF NOT EXISTS audit_events_hostname_idx
+            ON audit_events(hostname);
         ",
     )?;
     Ok(())
