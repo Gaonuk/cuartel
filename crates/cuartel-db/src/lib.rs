@@ -1,3 +1,4 @@
+pub mod audit;
 pub mod checkpoints;
 pub mod credentials;
 pub mod crypto;
