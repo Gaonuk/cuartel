@@ -4,6 +4,7 @@ pub mod credentials;
 pub mod crypto;
 pub mod schema;
 pub mod servers;
+pub mod sessions;
 pub mod workspaces;
 
 use anyhow::Result;
