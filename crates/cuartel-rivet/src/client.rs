@@ -84,6 +84,14 @@ impl Default for GetOrCreateRequest<'static> {
 }
 
 impl RivetClient {
+    /// Build a client against any rivet HTTP endpoint.
+    ///
+    /// `base_url` is stored as-is with a trailing slash trimmed; it may point
+    /// at the sidecar on this Mac (`http://localhost:6420`) or at a remote
+    /// rivet instance reached over Tailscale (`http://100.67.106.62:6420`).
+    /// Callers that already hold a registered server should prefer
+    /// `cuartel_remote::registry::rivet_client_for` which pulls the URL off
+    /// the registry row and keeps the rivet/remote boundary clean.
     pub fn new(base_url: &str) -> Self {
         Self {
             base_url: base_url.trim_end_matches('/').to_string(),
@@ -339,6 +347,22 @@ mod tests {
             action_url("http://localhost:6420/", "abc", "sendPrompt"),
             "http://localhost:6420/gateway/abc/action/sendPrompt"
         );
+    }
+
+    #[test]
+    fn action_url_works_with_remote_tailscale_ip() {
+        // Phase 7d: the client must be equally happy against a remote
+        // Tailscale-reachable rivet instance.
+        assert_eq!(
+            action_url("http://100.67.106.62:6420", "actor-xyz", "createSession"),
+            "http://100.67.106.62:6420/gateway/actor-xyz/action/createSession"
+        );
+    }
+
+    #[test]
+    fn client_preserves_base_url() {
+        let c = RivetClient::new("http://100.67.106.62:6420/");
+        assert_eq!(c.base_url(), "http://100.67.106.62:6420");
     }
 
     #[test]
