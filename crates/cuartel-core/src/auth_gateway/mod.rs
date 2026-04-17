@@ -11,10 +11,12 @@
 
 mod audit;
 mod host;
+mod persister;
 mod proxy;
 mod rules;
 
 pub use audit::{AuditEvent, AuditSender, DEFAULT_AUDIT_BUFFER};
 pub use host::{GatewayHost, GatewayStatus};
+pub use persister::{spawn_audit_persister, AuditSink, DatabaseAuditSink};
 pub use proxy::{bind, ProxyBody, ProxyBodyError};
 pub use rules::{default_rules, AuthGatewayConfig, AuthRule, MissPolicy, DUMMY_API_KEY};
