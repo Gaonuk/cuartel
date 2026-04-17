@@ -3,6 +3,7 @@ pub mod client;
 pub mod event_decode;
 pub mod events;
 pub mod filesystem;
+pub mod network;
 pub mod sidecar;
 pub mod workflow;
 
@@ -24,6 +25,9 @@ pub use events::{
     ProcessExitPayload, RivetEvent, SessionEventPayload, VmShutdownPayload, DEFAULT_CHANNELS,
     EVENT_CRON_EVENT, EVENT_PERMISSION_REQUEST, EVENT_PROCESS_EXIT, EVENT_PROCESS_OUTPUT,
     EVENT_SESSION_EVENT, EVENT_SHELL_DATA, EVENT_VM_BOOTED, EVENT_VM_SHUTDOWN,
+};
+pub use network::{
+    PortForwardConfig, PortForwardDirection, PortForwardEntry, VmFetchOptions, VmFetchResponse,
 };
 pub use sidecar::Sidecar;
 pub use workflow::{StartWorkflowRequest, WorkflowRecord, WorkflowSignal};
