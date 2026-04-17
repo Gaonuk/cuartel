@@ -30,7 +30,7 @@ impl AgentType {
     pub fn rivet_name(&self) -> &str {
         match self {
             AgentType::Pi => "pi",
-            AgentType::ClaudeCode => "claude-code",
+            AgentType::ClaudeCode => "claude",
             AgentType::Codex => "codex",
             AgentType::OpenCode => "opencode",
             AgentType::Custom(name) => name,

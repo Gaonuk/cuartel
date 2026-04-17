@@ -505,7 +505,7 @@ fn build_pending_permission(p: &PermissionRequestPayload) -> Option<PendingPermi
         summary.id = format!("perm-{}", uuid::Uuid::new_v4());
     }
     let session_label = SharedString::from(format!(
-        "pi session {}",
+        "session {}",
         &p.session_id[..8.min(p.session_id.len())]
     ));
     Some(PendingPermission::new(

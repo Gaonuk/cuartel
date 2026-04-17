@@ -27,7 +27,10 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::runtime::Handle;
 
-const DEFAULT_AGENT: AgentType = AgentType::Pi;
+/// Agent used when onboarding hasn't run yet (fresh install, no config
+/// on disk). Once the user completes onboarding the selected harness is
+/// persisted in `OnboardingConfig::default_harness` and takes precedence.
+const FALLBACK_AGENT: AgentType = AgentType::Pi;
 
 struct SessionSlot {
     id: String,
@@ -94,6 +97,10 @@ impl CuartelApp {
 
         let session_id = "session-1".to_string();
         let label = "Session 1".to_string();
+        let initial_agent = onboarding_config
+            .default_harness
+            .clone()
+            .unwrap_or(FALLBACK_AGENT);
 
         let terminal = cx.new(|cx| TerminalView::new_headless(cx));
         let permission_prompt = cx.new(|cx| PermissionPrompt::new(cx));
@@ -129,7 +136,7 @@ impl CuartelApp {
 
         let config = SessionHostConfig {
             session_id: session_id.clone(),
-            agent_type: DEFAULT_AGENT.rivet_name().to_string(),
+            agent_type: initial_agent.rivet_name().to_string(),
             actor_key: format!("cuartel-{session_id}"),
             workspace_id: "workspace-default".to_string(),
         };
@@ -150,7 +157,7 @@ impl CuartelApp {
         let slot = SessionSlot {
             id: session_id.clone(),
             label: label.clone(),
-            agent: DEFAULT_AGENT,
+            agent: initial_agent.clone(),
             terminal,
             diff_view,
             timeline_view,
@@ -165,7 +172,7 @@ impl CuartelApp {
         let tab_info = TabInfo {
             session_id: session_id.clone(),
             label: SharedString::from(label.clone()),
-            agent: DEFAULT_AGENT,
+            agent: initial_agent.clone(),
             state: SessionState::Created,
         };
         tab_bar.update(cx, |tb, cx| {
@@ -233,6 +240,13 @@ impl CuartelApp {
         &self.sessions[self.active_session_idx]
     }
 
+    fn default_agent(&self) -> AgentType {
+        self.onboarding_config
+            .default_harness
+            .clone()
+            .unwrap_or(FALLBACK_AGENT)
+    }
+
     fn find_slot_idx(&self, session_id: &str) -> Option<usize> {
         self.sessions.iter().position(|s| s.id == session_id)
     }
@@ -265,6 +279,7 @@ impl CuartelApp {
         self.next_session_num += 1;
         let session_id = format!("session-{num}");
         let label = format!("Session {num}");
+        let agent = self.default_agent();
 
         let terminal = cx.new(|cx| TerminalView::new_headless(cx));
         let permission_prompt = cx.new(|cx| PermissionPrompt::new(cx));
@@ -280,7 +295,7 @@ impl CuartelApp {
 
         let config = SessionHostConfig {
             session_id: session_id.clone(),
-            agent_type: DEFAULT_AGENT.rivet_name().to_string(),
+            agent_type: agent.rivet_name().to_string(),
             actor_key: format!("cuartel-{session_id}"),
             workspace_id: "workspace-default".to_string(),
         };
@@ -301,7 +316,7 @@ impl CuartelApp {
         let slot = SessionSlot {
             id: session_id.clone(),
             label: label.clone(),
-            agent: DEFAULT_AGENT,
+            agent,
             terminal,
             diff_view,
             timeline_view,
@@ -626,6 +641,14 @@ impl CuartelApp {
         self.next_session_num += 1;
         let session_id = format!("session-{num}");
         let label = format!("Fork {num} (from {})", &event.checkpoint_id[..8.min(event.checkpoint_id.len())]);
+        // Forks inherit the parent session's agent so the replay runs on
+        // the same harness. If we can't find the parent (shouldn't happen
+        // — the fork event came from a live session), fall back to the
+        // current default.
+        let agent = self
+            .find_slot_idx(&event.session_id)
+            .map(|idx| self.sessions[idx].agent.clone())
+            .unwrap_or_else(|| self.default_agent());
 
         let terminal = cx.new(|cx| TerminalView::new_headless(cx));
         let permission_prompt = cx.new(|cx| PermissionPrompt::new(cx));
@@ -641,7 +664,7 @@ impl CuartelApp {
 
         let config = SessionHostConfig {
             session_id: session_id.clone(),
-            agent_type: DEFAULT_AGENT.rivet_name().to_string(),
+            agent_type: agent.rivet_name().to_string(),
             actor_key: format!("cuartel-{session_id}"),
             workspace_id: "workspace-default".to_string(),
         };
@@ -662,7 +685,7 @@ impl CuartelApp {
         let slot = SessionSlot {
             id: session_id.clone(),
             label,
-            agent: DEFAULT_AGENT,
+            agent,
             terminal,
             diff_view,
             timeline_view,
