@@ -55,10 +55,25 @@ pub struct AuthRule {
     /// key in a shape we didn't intend, or smuggling in a real key.
     #[serde(default = "default_strip_headers")]
     pub strip_headers: Vec<String>,
+    /// Upstream URI scheme. Defaults to `https`. Plain `http` is supported
+    /// for testing against fake upstreams and for the rare internal
+    /// provider that speaks HTTP on a trusted network.
+    #[serde(default = "default_scheme")]
+    pub upstream_scheme: String,
+    /// Optional upstream authority override (`host[:port]`). When `None`,
+    /// the rule's `hostname` is used. Tests point this at `127.0.0.1:<port>`
+    /// so traffic lands on a fake upstream while rule matching still keys
+    /// off the public hostname the agent dialed.
+    #[serde(default)]
+    pub upstream_authority: Option<String>,
 }
 
 fn default_strip_headers() -> Vec<String> {
     vec!["authorization".to_string(), "x-api-key".to_string()]
+}
+
+fn default_scheme() -> String {
+    "https".to_string()
 }
 
 impl AuthRule {
@@ -129,6 +144,8 @@ pub fn default_rules() -> Vec<AuthRule> {
             header_name: "x-api-key".to_string(),
             header_format: "{key}".to_string(),
             strip_headers: default_strip_headers(),
+            upstream_scheme: default_scheme(),
+            upstream_authority: None,
         },
         AuthRule {
             hostname: "api.openai.com".to_string(),
@@ -137,6 +154,8 @@ pub fn default_rules() -> Vec<AuthRule> {
             header_name: "Authorization".to_string(),
             header_format: "Bearer {key}".to_string(),
             strip_headers: default_strip_headers(),
+            upstream_scheme: default_scheme(),
+            upstream_authority: None,
         },
         AuthRule {
             hostname: "generativelanguage.googleapis.com".to_string(),
@@ -145,6 +164,8 @@ pub fn default_rules() -> Vec<AuthRule> {
             header_name: "x-goog-api-key".to_string(),
             header_format: "{key}".to_string(),
             strip_headers: default_strip_headers(),
+            upstream_scheme: default_scheme(),
+            upstream_authority: None,
         },
     ]
 }
@@ -206,6 +227,8 @@ mod tests {
                 header_name: "x-api-key".to_string(),
                 header_format: "{key}".to_string(),
                 strip_headers: vec![],
+                upstream_scheme: "https".to_string(),
+                upstream_authority: None,
             },
         );
         assert_eq!(

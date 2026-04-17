@@ -36,6 +36,11 @@ rust-embed = "8"
 base64 = "0.22"
 async-trait = "0.1"
 keyring = { version = "3", features = ["apple-native"] }
+hyper = { version = "1", features = ["server", "client", "http1"] }
+hyper-util = { version = "0.1", features = ["server", "client", "client-legacy", "http1", "tokio"] }
+hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "ring", "native-tokio", "tls12"] }
+http-body-util = "0.1"
+bytes = "1"
 
 cuartel-core = { path = "crates/cuartel-core" }
 cuartel-terminal = { path = "crates/cuartel-terminal" }
