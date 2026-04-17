@@ -4,6 +4,7 @@ pub struct Theme {
     pub bg_primary: u32,
     pub bg_secondary: u32,
     pub bg_sidebar: u32,
+    #[allow(dead_code)]
     pub bg_terminal: u32,
     pub bg_hover: u32,
     pub bg_active: u32,
@@ -38,6 +39,7 @@ impl Theme {
     }
 }
 
+#[allow(dead_code)]
 pub fn rgb_color(hex: u32) -> gpui::Hsla {
     rgb(hex).into()
 }

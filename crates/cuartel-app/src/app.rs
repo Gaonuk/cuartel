@@ -193,22 +193,26 @@ impl CuartelApp {
         cx.subscribe(&sidebar, Self::on_server_selected).detach();
         cx.subscribe(&workspace, Self::on_prompt_submitted).detach();
         cx.subscribe(&workspace, Self::on_review_apply).detach();
-        cx.subscribe(&workspace, Self::on_checkpoint_restore).detach();
+        cx.subscribe(&workspace, Self::on_checkpoint_restore)
+            .detach();
         cx.subscribe(&workspace, Self::on_checkpoint_fork).detach();
-        cx.subscribe(&workspace, Self::on_checkpoint_delete).detach();
+        cx.subscribe(&workspace, Self::on_checkpoint_delete)
+            .detach();
         cx.subscribe(&workspace, Self::on_port_forward_add).detach();
-        cx.subscribe(&workspace, Self::on_port_forward_remove).detach();
-        cx.subscribe(&workspace, Self::on_port_forward_toggle).detach();
+        cx.subscribe(&workspace, Self::on_port_forward_remove)
+            .detach();
+        cx.subscribe(&workspace, Self::on_port_forward_toggle)
+            .detach();
         cx.subscribe(&tab_bar, Self::on_tab_selected).detach();
         cx.subscribe(&tab_bar, Self::on_new_tab_requested).detach();
-        cx.subscribe(&tab_bar, Self::on_tab_close_requested).detach();
+        cx.subscribe(&tab_bar, Self::on_tab_close_requested)
+            .detach();
 
         let onboarding_view = if !onboarding_config.completed {
             let initial_default = onboarding_config.default_harness.clone();
             let reg = registry.clone();
             let creds = credentials.clone();
-            let ov =
-                cx.new(move |cx| OnboardingView::new(reg, creds, initial_default, cx));
+            let ov = cx.new(move |cx| OnboardingView::new(reg, creds, initial_default, cx));
             cx.subscribe(&ov, Self::on_onboarding_completed).detach();
             Some(ov)
         } else {
@@ -563,9 +567,7 @@ impl CuartelApp {
             PermissionDecision::Approve { id, session_id } => {
                 (id.clone(), session_id.clone(), true)
             }
-            PermissionDecision::Deny { id, session_id } => {
-                (id.clone(), session_id.clone(), false)
-            }
+            PermissionDecision::Deny { id, session_id } => (id.clone(), session_id.clone(), false),
         };
         // Route to the correct session's host by matching on permission's session_id.
         // Fall back to the active session if no match (e.g. fixture data with no real session_id).
@@ -644,7 +646,10 @@ impl CuartelApp {
         let num = self.next_session_num;
         self.next_session_num += 1;
         let session_id = format!("session-{num}");
-        let label = format!("Fork {num} (from {})", &event.checkpoint_id[..8.min(event.checkpoint_id.len())]);
+        let label = format!(
+            "Fork {num} (from {})",
+            &event.checkpoint_id[..8.min(event.checkpoint_id.len())]
+        );
         // Forks inherit the parent session's agent so the replay runs on
         // the same harness. If we can't find the parent (shouldn't happen
         // — the fork event came from a live session), fall back to the
@@ -807,6 +812,7 @@ impl CuartelApp {
         // TODO: call rivet_client.add/remove_port_forward + update DB.
     }
 
+    #[allow(dead_code)]
     pub fn set_workspace_path(&mut self, path: PathBuf) {
         self.workspace_path = Some(path);
     }
@@ -831,6 +837,11 @@ impl Render for CuartelApp {
 }
 
 fn make_session_item(slot: &SessionSlot) -> SessionItem {
-    SessionItem::new(&slot.id, &slot.label, slot.agent.clone(), slot.state.clone())
-        .with_created_at(Utc::now())
+    SessionItem::new(
+        &slot.id,
+        &slot.label,
+        slot.agent.clone(),
+        slot.state.clone(),
+    )
+    .with_created_at(Utc::now())
 }

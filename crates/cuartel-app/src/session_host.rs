@@ -93,6 +93,7 @@ pub struct SessionHost {
     terminal: Entity<TerminalView>,
     permission_prompt: Entity<PermissionPrompt>,
     session: Session,
+    #[allow(dead_code)]
     env: HashMap<String, String>,
     cmd_tx: UnboundedSender<SessionHostCommand>,
     _driver_task: Task<()>,
@@ -171,6 +172,7 @@ impl SessionHost {
         }
     }
 
+    #[allow(dead_code)]
     pub fn config(&self) -> &SessionHostConfig {
         &self.config
     }
@@ -189,6 +191,7 @@ impl SessionHost {
         let _ = self.cmd_tx.send(SessionHostCommand::SendPrompt(text));
     }
 
+    #[allow(dead_code)]
     pub fn state(&self) -> &SessionState {
         &self.session.state
     }

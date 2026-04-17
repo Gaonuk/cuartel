@@ -25,7 +25,7 @@ use tokio::net::TcpListener;
 use crate::credential_store::CredentialStore;
 
 use super::audit::{AuditEvent, AuditSender};
-use super::firewall::{is_blocked_ip, parse_ip_authority, FirewallPolicy, BLOCK_REASON_PRIVATE_UPSTREAM};
+use super::firewall::{is_blocked_ip, parse_ip_authority, BLOCK_REASON_PRIVATE_UPSTREAM};
 use super::rules::{AuthGatewayConfig, AuthRule, MissPolicy};
 
 /// Unified body type we forward upstream and stream back downstream.

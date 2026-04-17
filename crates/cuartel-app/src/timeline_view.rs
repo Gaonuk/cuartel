@@ -56,6 +56,7 @@ impl TimelineView {
         }
     }
 
+    #[allow(dead_code)]
     pub fn set_session_id(&mut self, session_id: String, cx: &mut Context<Self>) {
         if self.session_id != session_id {
             self.session_id = session_id;
@@ -65,6 +66,7 @@ impl TimelineView {
         }
     }
 
+    #[allow(dead_code)]
     pub fn set_checkpoints(&mut self, checkpoints: Vec<Checkpoint>, cx: &mut Context<Self>) {
         self.checkpoints = checkpoints;
         // Keep selection if still valid, otherwise clear.
@@ -205,21 +207,16 @@ impl Render for TimelineView {
             .border_b_1()
             .border_color(rgb(theme.border))
             .child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap_2()
-                    .child(
-                        div()
-                            .text_xs()
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(rgb(theme.text_secondary))
-                            .child(SharedString::from(format!(
-                                "{count} checkpoint{}",
-                                if count == 1 { "" } else { "s" }
-                            ))),
-                    ),
+                div().flex().flex_row().items_center().gap_2().child(
+                    div()
+                        .text_xs()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(rgb(theme.text_secondary))
+                        .child(SharedString::from(format!(
+                            "{count} checkpoint{}",
+                            if count == 1 { "" } else { "s" }
+                        ))),
+                ),
             )
             .child(
                 div()
@@ -363,10 +360,7 @@ fn render_checkpoint_row(
         .iter()
         .any(|other| other.parent_checkpoint_id.as_deref() == Some(&cp.id));
 
-    let label = cp
-        .label
-        .as_deref()
-        .unwrap_or("Unnamed checkpoint");
+    let label = cp.label.as_deref().unwrap_or("Unnamed checkpoint");
     let label = SharedString::from(label.to_string());
 
     let timestamp = format_timestamp(&cp.created_at);
@@ -503,21 +497,14 @@ fn render_checkpoint_row(
 
 // --- Checkpoint detail panel ----------------------------------------------
 
-fn render_checkpoint_detail(
-    cp: &Checkpoint,
-    all_checkpoints: &[Checkpoint],
-    theme: &Theme,
-) -> Div {
+fn render_checkpoint_detail(cp: &Checkpoint, all_checkpoints: &[Checkpoint], theme: &Theme) -> Div {
     let is_fork = cp.parent_checkpoint_id.is_some();
     let children_count = all_checkpoints
         .iter()
         .filter(|other| other.parent_checkpoint_id.as_deref() == Some(&cp.id))
         .count();
 
-    let label = cp
-        .label
-        .as_deref()
-        .unwrap_or("Unnamed checkpoint");
+    let label = cp.label.as_deref().unwrap_or("Unnamed checkpoint");
 
     let header = div()
         .flex()
@@ -564,7 +551,10 @@ fn render_checkpoint_detail(
     if children_count > 0 {
         rows.push(detail_row(
             "Forks",
-            &format!("{children_count} fork{}", if children_count == 1 { "" } else { "s" }),
+            &format!(
+                "{children_count} fork{}",
+                if children_count == 1 { "" } else { "s" }
+            ),
             theme,
         ));
     }
