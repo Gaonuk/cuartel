@@ -168,6 +168,7 @@ mod tests {
             rules: vec![],
             bind: "127.0.0.1:0".parse().unwrap(),
             on_miss: MissPolicy::Reject,
+            firewall: Default::default(),
         };
         let host = GatewayHost::spawn(rt, store, config);
 
@@ -196,6 +197,7 @@ mod tests {
             rules: vec![],
             bind: "127.0.0.1:0".parse().unwrap(),
             on_miss: MissPolicy::Reject,
+            firewall: Default::default(),
         };
         let host = GatewayHost::spawn(rt, store, config);
 
@@ -251,6 +253,7 @@ mod tests {
             }],
             bind: "127.0.0.1:0".parse().unwrap(),
             on_miss: MissPolicy::Reject,
+            firewall: Default::default(),
         };
         let host = GatewayHost::spawn(rt, store, config);
         let mut rx = host.subscribe_audit();
