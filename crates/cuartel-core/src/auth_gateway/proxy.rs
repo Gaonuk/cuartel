@@ -6,7 +6,9 @@
 //! over TLS. Response bodies stream back unbuffered (SSE-safe).
 
 use std::convert::Infallible;
+use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::SystemTime;
 
 use anyhow::{anyhow, Context, Result};
 use bytes::Bytes;
@@ -22,6 +24,7 @@ use tokio::net::TcpListener;
 
 use crate::credential_store::CredentialStore;
 
+use super::audit::{AuditEvent, AuditSender};
 use super::rules::{AuthGatewayConfig, AuthRule, MissPolicy};
 
 /// Unified body type we forward upstream and stream back downstream.
@@ -38,10 +41,16 @@ type UpstreamClient = Client<hyper_rustls::HttpsConnector<HttpConnector>, ProxyB
 /// Start serving the gateway on `config.bind`. Returns the actual bound
 /// address (important when `bind.port() == 0`) and a future that drives the
 /// accept loop. Caller owns the future and decides when to drop it.
+///
+/// `audit` is optional: when `Some`, the proxy emits an `AuditEvent` on
+/// every request outcome. Dropped events (no subscribers, or full buffer)
+/// are silently ignored — audit is a diagnostic aid, not a load-bearing
+/// control.
 pub async fn bind(
     config: AuthGatewayConfig,
     creds: Arc<dyn CredentialStore>,
-) -> Result<(std::net::SocketAddr, impl std::future::Future<Output = ()>)> {
+    audit: Option<AuditSender>,
+) -> Result<(SocketAddr, impl std::future::Future<Output = ()>)> {
     let listener = TcpListener::bind(config.bind)
         .await
         .with_context(|| format!("bind auth gateway to {}", config.bind))?;
@@ -60,11 +69,12 @@ pub async fn bind(
         config,
         creds,
         upstream,
+        audit,
     });
 
     let future = async move {
         loop {
-            let (stream, _peer) = match listener.accept().await {
+            let (stream, peer) = match listener.accept().await {
                 Ok(v) => v,
                 Err(e) => {
                     log::warn!("auth gateway accept error: {e}");
@@ -76,7 +86,8 @@ pub async fn bind(
             tokio::spawn(async move {
                 let service = service_fn(move |req| {
                     let state = Arc::clone(&state);
-                    async move { Ok::<_, Infallible>(handle(state, req).await) }
+                    let peer_ip = peer.ip();
+                    async move { Ok::<_, Infallible>(handle(state, req, peer_ip).await) }
                 });
                 if let Err(e) = hyper::server::conn::http1::Builder::new()
                     .serve_connection(io, service)
@@ -95,10 +106,23 @@ struct ProxyState {
     config: AuthGatewayConfig,
     creds: Arc<dyn CredentialStore>,
     upstream: UpstreamClient,
+    audit: Option<AuditSender>,
 }
 
-async fn handle(state: Arc<ProxyState>, req: Request<Incoming>) -> Response<ProxyBody> {
-    match handle_inner(state, req).await {
+impl ProxyState {
+    fn emit(&self, event: AuditEvent) {
+        if let Some(tx) = &self.audit {
+            let _ = tx.send(event);
+        }
+    }
+}
+
+async fn handle(
+    state: Arc<ProxyState>,
+    req: Request<Incoming>,
+    peer_ip: std::net::IpAddr,
+) -> Response<ProxyBody> {
+    match handle_inner(state, req, peer_ip).await {
         Ok(resp) => resp,
         Err(e) => {
             log::warn!("auth gateway request failed: {e:#}");
@@ -110,7 +134,14 @@ async fn handle(state: Arc<ProxyState>, req: Request<Incoming>) -> Response<Prox
 async fn handle_inner(
     state: Arc<ProxyState>,
     req: Request<Incoming>,
+    peer_ip: std::net::IpAddr,
 ) -> Result<Response<ProxyBody>> {
+    let method = req.method().as_str().to_string();
+    let path = req
+        .uri()
+        .path_and_query()
+        .map(|p| p.as_str().to_string())
+        .unwrap_or_else(|| "/".into());
     let hostname = request_hostname(&req).ok_or_else(|| anyhow!("missing Host header"))?;
 
     let (rule_clone, policy) = match state.config.match_host(&hostname) {
@@ -120,10 +151,20 @@ async fn handle_inner(
 
     let Some(rule) = rule_clone else {
         return match policy {
-            MissPolicy::Reject => Ok(error_response(
-                StatusCode::BAD_GATEWAY,
-                &format!("no auth gateway rule for host {hostname}"),
-            )),
+            MissPolicy::Reject => {
+                state.emit(AuditEvent::Blocked {
+                    timestamp: SystemTime::now(),
+                    client_ip: Some(peer_ip),
+                    hostname: hostname.clone(),
+                    method: method.clone(),
+                    path: path.clone(),
+                    reason: "no rule for host".into(),
+                });
+                Ok(error_response(
+                    StatusCode::BAD_GATEWAY,
+                    &format!("no auth gateway rule for host {hostname}"),
+                ))
+            }
             MissPolicy::Passthrough => passthrough(&state.upstream, req, &hostname).await,
         };
     };
@@ -131,28 +172,59 @@ async fn handle_inner(
     let credential = match state.creds.get(&rule.provider_id, &rule.env_key) {
         Ok(Some(v)) if !v.is_empty() => v,
         Ok(_) => {
+            state.emit(AuditEvent::CredentialMissing {
+                timestamp: SystemTime::now(),
+                hostname: hostname.clone(),
+                provider_id: rule.provider_id.clone(),
+                env_key: rule.env_key.clone(),
+            });
             return Ok(error_response(
                 StatusCode::BAD_GATEWAY,
                 &format!(
                     "credential {}:{} not configured",
                     rule.provider_id, rule.env_key
                 ),
-            ))
+            ));
         }
         Err(e) => {
+            state.emit(AuditEvent::CredentialMissing {
+                timestamp: SystemTime::now(),
+                hostname: hostname.clone(),
+                provider_id: rule.provider_id.clone(),
+                env_key: rule.env_key.clone(),
+            });
             return Ok(error_response(
                 StatusCode::BAD_GATEWAY,
                 &format!("credential lookup failed: {e}"),
-            ))
+            ));
         }
     };
 
     let upstream_req = build_upstream_request(req, &rule, &credential, &hostname)?;
-    let resp = state
-        .upstream
-        .request(upstream_req)
-        .await
-        .with_context(|| format!("upstream request to {hostname}"))?;
+    let resp = match state.upstream.request(upstream_req).await {
+        Ok(r) => r,
+        Err(e) => {
+            state.emit(AuditEvent::UpstreamError {
+                timestamp: SystemTime::now(),
+                hostname: hostname.clone(),
+                provider_id: rule.provider_id.clone(),
+                error: e.to_string(),
+            });
+            return Err(anyhow!("upstream request to {hostname}: {e}"));
+        }
+    };
+
+    let status = resp.status().as_u16();
+    state.emit(AuditEvent::Injected {
+        timestamp: SystemTime::now(),
+        client_ip: Some(peer_ip),
+        hostname: hostname.clone(),
+        provider_id: rule.provider_id.clone(),
+        env_key: rule.env_key.clone(),
+        method,
+        path,
+        status,
+    });
     Ok(box_response(resp))
 }
 
@@ -383,7 +455,7 @@ mod tests {
             bind: "127.0.0.1:0".parse().unwrap(),
             on_miss: MissPolicy::Reject,
         };
-        let (addr, fut) = bind(config, store).await.unwrap();
+        let (addr, fut) = bind(config, store, None).await.unwrap();
         let handle = tokio::spawn(fut);
 
         let response = raw_get(addr, "evil.example.com", "/").await.unwrap();
@@ -410,7 +482,7 @@ mod tests {
             bind: "127.0.0.1:0".parse().unwrap(),
             on_miss: MissPolicy::Reject,
         };
-        let (addr, fut) = bind(config, store).await.unwrap();
+        let (addr, fut) = bind(config, store, None).await.unwrap();
         let handle = tokio::spawn(fut);
 
         let response = raw_get(addr, "api.anthropic.com", "/v1/x").await.unwrap();
@@ -471,7 +543,7 @@ mod tests {
             bind: "127.0.0.1:0".parse().unwrap(),
             on_miss: MissPolicy::Reject,
         };
-        let (gateway_addr, fut) = bind(config, store).await.unwrap();
+        let (gateway_addr, fut) = bind(config, store, None).await.unwrap();
         let gateway_handle = tokio::spawn(fut);
 
         // 4. Client hits the gateway with the dummy key.

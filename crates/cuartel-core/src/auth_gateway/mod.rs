@@ -9,8 +9,12 @@
 //! This module is currently **PR-1**: pure types + default rules + tests.
 //! The hyper proxy server lands in a follow-up PR (`proxy.rs`).
 
+mod audit;
+mod host;
 mod proxy;
 mod rules;
 
+pub use audit::{AuditEvent, AuditSender, DEFAULT_AUDIT_BUFFER};
+pub use host::{GatewayHost, GatewayStatus};
 pub use proxy::{bind, ProxyBody, ProxyBodyError};
 pub use rules::{default_rules, AuthGatewayConfig, AuthRule, MissPolicy, DUMMY_API_KEY};
