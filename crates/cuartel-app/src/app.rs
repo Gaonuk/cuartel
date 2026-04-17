@@ -7,6 +7,7 @@ use crate::sidebar::{SessionItem, SessionSelected, SettingsRequested, Sidebar};
 use crate::sidecar_host::SidecarStatus;
 use crate::tab_bar::{NewTabRequested, TabBar, TabCloseRequested, TabInfo, TabSelected};
 use crate::theme::Theme;
+use crate::timeline_view::{CheckpointDelete, CheckpointFork, CheckpointRestore, TimelineView};
 use crate::workspace::{PromptSubmitted, WorkspaceView};
 use chrono::Utc;
 use cuartel_core::agent::{AgentType, HarnessRegistry};
@@ -31,6 +32,7 @@ struct SessionSlot {
     agent: AgentType,
     terminal: Entity<TerminalView>,
     diff_view: Entity<DiffView>,
+    timeline_view: Entity<TimelineView>,
     permission_prompt: Entity<PermissionPrompt>,
     session_host: Entity<SessionHost>,
     state: SessionState,
@@ -75,28 +77,35 @@ impl CuartelApp {
 
         let tab_bar = cx.new(|cx| TabBar::new(cx));
 
+        let session_id = "session-1".to_string();
+        let label = "Session 1".to_string();
+
         let terminal = cx.new(|cx| TerminalView::new_headless(cx));
         let permission_prompt = cx.new(|cx| PermissionPrompt::new(cx));
         let diff_view = cx.new(|cx| DiffView::new(fixture_diffs(), cx));
+        let timeline_view = cx.new({
+            let sid = session_id.clone();
+            move |cx| TimelineView::new(sid, cx)
+        });
 
         let workspace = cx.new({
             let tab_bar = tab_bar.clone();
             let permission_prompt = permission_prompt.clone();
             let terminal = terminal.clone();
             let diff_view = diff_view.clone();
+            let timeline_view = timeline_view.clone();
             |cx| {
                 WorkspaceView::new(
                     tab_bar,
                     terminal,
                     diff_view,
+                    timeline_view,
                     permission_prompt,
                     cx,
                 )
             }
         });
 
-        let session_id = "session-1".to_string();
-        let label = "Session 1".to_string();
         let config = SessionHostConfig {
             session_id: session_id.clone(),
             agent_type: DEFAULT_AGENT.rivet_name().to_string(),
@@ -123,6 +132,7 @@ impl CuartelApp {
             agent: DEFAULT_AGENT,
             terminal,
             diff_view,
+            timeline_view,
             permission_prompt,
             session_host,
             state: SessionState::Created,
@@ -150,6 +160,9 @@ impl CuartelApp {
         cx.subscribe(&sidebar, Self::on_settings_requested).detach();
         cx.subscribe(&workspace, Self::on_prompt_submitted).detach();
         cx.subscribe(&workspace, Self::on_review_apply).detach();
+        cx.subscribe(&workspace, Self::on_checkpoint_restore).detach();
+        cx.subscribe(&workspace, Self::on_checkpoint_fork).detach();
+        cx.subscribe(&workspace, Self::on_checkpoint_delete).detach();
         cx.subscribe(&tab_bar, Self::on_tab_selected).detach();
         cx.subscribe(&tab_bar, Self::on_new_tab_requested).detach();
         cx.subscribe(&tab_bar, Self::on_tab_close_requested).detach();
@@ -208,6 +221,7 @@ impl CuartelApp {
             ws.swap_views(
                 slot.terminal.clone(),
                 slot.diff_view.clone(),
+                slot.timeline_view.clone(),
                 slot.permission_prompt.clone(),
                 cx,
             );
@@ -225,6 +239,10 @@ impl CuartelApp {
         let terminal = cx.new(|cx| TerminalView::new_headless(cx));
         let permission_prompt = cx.new(|cx| PermissionPrompt::new(cx));
         let diff_view = cx.new(|cx| DiffView::new(fixture_diffs(), cx));
+        let timeline_view = cx.new({
+            let sid = session_id.clone();
+            move |cx| TimelineView::new(sid, cx)
+        });
 
         let config = SessionHostConfig {
             session_id: session_id.clone(),
@@ -252,6 +270,7 @@ impl CuartelApp {
             agent: DEFAULT_AGENT,
             terminal,
             diff_view,
+            timeline_view,
             permission_prompt,
             session_host,
             state: SessionState::Created,
@@ -295,6 +314,7 @@ impl CuartelApp {
             ws.swap_views(
                 slot.terminal.clone(),
                 slot.diff_view.clone(),
+                slot.timeline_view.clone(),
                 slot.permission_prompt.clone(),
                 cx,
             );
@@ -509,6 +529,105 @@ impl CuartelApp {
             },
             Err(e) => log::error!("[review] plan failed: {e}"),
         }
+    }
+
+    fn on_checkpoint_restore(
+        &mut self,
+        _view: Entity<WorkspaceView>,
+        event: &CheckpointRestore,
+        _cx: &mut Context<Self>,
+    ) {
+        // TODO: Phase 6d integration — call rivet_client.restore_checkpoint
+        // with fork=false to rewind the active session in place. For now,
+        // log the intent so the UI flow is exercisable.
+        log::info!(
+            "[checkpoint] restore requested: checkpoint_id={}",
+            event.checkpoint_id,
+        );
+    }
+
+    fn on_checkpoint_fork(
+        &mut self,
+        _view: Entity<WorkspaceView>,
+        event: &CheckpointFork,
+        cx: &mut Context<Self>,
+    ) {
+        log::info!(
+            "[checkpoint] fork requested: checkpoint_id={} session_id={}",
+            event.checkpoint_id,
+            event.session_id,
+        );
+        // Create a new session as the forked branch. The Rivet
+        // restore_checkpoint(fork=true) call will be wired in a follow-up
+        // once the sidecar supports it. For now, create the session slot
+        // so the tab/sidebar UX is complete.
+        let num = self.next_session_num;
+        self.next_session_num += 1;
+        let session_id = format!("session-{num}");
+        let label = format!("Fork {num} (from {})", &event.checkpoint_id[..8.min(event.checkpoint_id.len())]);
+
+        let terminal = cx.new(|cx| TerminalView::new_headless(cx));
+        let permission_prompt = cx.new(|cx| PermissionPrompt::new(cx));
+        let diff_view = cx.new(|cx| DiffView::new(vec![], cx));
+        let timeline_view = cx.new({
+            let sid = session_id.clone();
+            move |cx| TimelineView::new(sid, cx)
+        });
+
+        let config = SessionHostConfig {
+            session_id: session_id.clone(),
+            agent_type: DEFAULT_AGENT.rivet_name().to_string(),
+            actor_key: format!("cuartel-{session_id}"),
+            workspace_id: "workspace-default".to_string(),
+        };
+
+        let session_host = cx.new({
+            let runtime = self.runtime_handle.clone();
+            let client = self.rivet_client.clone();
+            let status = self.sidecar_status.clone();
+            let terminal = terminal.clone();
+            let perm = permission_prompt.clone();
+            let env = self.sidecar_env.clone();
+            move |cx| SessionHost::new(config, runtime, client, status, terminal, perm, env, cx)
+        });
+
+        let host_sub = cx.subscribe(&session_host, Self::on_session_state_change);
+        let perm_sub = cx.subscribe(&permission_prompt, Self::on_permission_decision);
+
+        let slot = SessionSlot {
+            id: session_id.clone(),
+            label,
+            agent: DEFAULT_AGENT,
+            terminal,
+            diff_view,
+            timeline_view,
+            permission_prompt,
+            session_host,
+            state: SessionState::Created,
+            _host_sub: host_sub,
+            _perm_sub: perm_sub,
+        };
+
+        self.sessions.push(slot);
+        let new_idx = self.sessions.len() - 1;
+
+        self.sync_tab_bar(cx);
+        self.sync_sidebar(cx);
+        self.switch_to(new_idx, cx);
+    }
+
+    fn on_checkpoint_delete(
+        &mut self,
+        _view: Entity<WorkspaceView>,
+        event: &CheckpointDelete,
+        _cx: &mut Context<Self>,
+    ) {
+        // TODO: Phase 6d integration — call rivet_client.delete_checkpoint
+        // and remove from the local checkpoint store. For now, log the intent.
+        log::info!(
+            "[checkpoint] delete requested: checkpoint_id={}",
+            event.checkpoint_id,
+        );
     }
 
     pub fn set_workspace_path(&mut self, path: PathBuf) {
