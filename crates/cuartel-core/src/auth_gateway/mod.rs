@@ -10,12 +10,14 @@
 //! The hyper proxy server lands in a follow-up PR (`proxy.rs`).
 
 mod audit;
+mod firewall;
 mod host;
 mod persister;
 mod proxy;
 mod rules;
 
 pub use audit::{AuditEvent, AuditSender, DEFAULT_AUDIT_BUFFER};
+pub use firewall::{is_blocked_ip, parse_ip_authority, FirewallPolicy, BLOCK_REASON_PRIVATE_UPSTREAM};
 pub use host::{GatewayHost, GatewayStatus};
 pub use persister::{spawn_audit_persister, AuditSink, DatabaseAuditSink};
 pub use proxy::{bind, ProxyBody, ProxyBodyError};

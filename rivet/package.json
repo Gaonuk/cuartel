@@ -10,7 +10,8 @@
   "dependencies": {
     "rivetkit": "latest",
     "@rivet-dev/agent-os-common": "latest",
-    "@rivet-dev/agent-os-pi": "latest"
+    "@rivet-dev/agent-os-pi": "latest",
+    "@rivet-dev/agent-os-claude": "latest"
   },
   "devDependencies": {
     "tsx": "^4.19.0",

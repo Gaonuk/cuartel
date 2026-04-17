@@ -8,6 +8,8 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
 use serde::{Deserialize, Serialize};
 
+use super::firewall::FirewallPolicy;
+
 /// Dummy credential sentinel surfaced to VM-side agents. The real key never
 /// leaves the host; the gateway swaps this value for the stored credential
 /// after matching the request's `Host` header against a rule. Prefixed with
@@ -98,6 +100,12 @@ pub struct AuthGatewayConfig {
     pub bind: SocketAddr,
     #[serde(default)]
     pub on_miss: MissPolicy,
+    /// Firewall policy for upstream authorities (task 5f). Defaults to
+    /// rejecting loopback/private addresses; tests and local fixtures
+    /// flip `allow_private_upstreams` to let the proxy talk to a fake
+    /// upstream on 127.0.0.1.
+    #[serde(default)]
+    pub firewall: FirewallPolicy,
 }
 
 fn default_bind() -> SocketAddr {
@@ -111,6 +119,7 @@ impl AuthGatewayConfig {
             rules: default_rules(),
             bind: default_bind(),
             on_miss: MissPolicy::default(),
+            firewall: FirewallPolicy::default(),
         }
     }
 
@@ -129,6 +138,7 @@ impl Default for AuthGatewayConfig {
             rules: Vec::new(),
             bind: default_bind(),
             on_miss: MissPolicy::default(),
+            firewall: FirewallPolicy::default(),
         }
     }
 }
@@ -269,6 +279,16 @@ mod tests {
         assert_eq!(back.rules, cfg.rules);
         assert_eq!(back.on_miss, cfg.on_miss);
         assert_eq!(back.bind, cfg.bind);
+        assert_eq!(back.firewall, cfg.firewall);
+    }
+
+    #[test]
+    fn config_without_firewall_key_keeps_restrictive_default() {
+        // Configs written by pre-5f builds won't have a `firewall` key.
+        // They must still deserialize, with the firewall locked down.
+        let cfg: AuthGatewayConfig =
+            serde_json::from_str(r#"{"rules":[],"on_miss":"reject"}"#).unwrap();
+        assert!(!cfg.firewall.allow_private_upstreams);
     }
 
     #[test]

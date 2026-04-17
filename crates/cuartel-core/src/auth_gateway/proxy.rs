@@ -25,6 +25,7 @@ use tokio::net::TcpListener;
 use crate::credential_store::CredentialStore;
 
 use super::audit::{AuditEvent, AuditSender};
+use super::firewall::{is_blocked_ip, parse_ip_authority, FirewallPolicy, BLOCK_REASON_PRIVATE_UPSTREAM};
 use super::rules::{AuthGatewayConfig, AuthRule, MissPolicy};
 
 /// Unified body type we forward upstream and stream back downstream.
@@ -199,6 +200,37 @@ async fn handle_inner(
             ));
         }
     };
+
+    // 5f firewall: if the rule's upstream authority is an IP literal in a
+    // blocked class (loopback, RFC1918, link-local, etc.), refuse to
+    // forward. Hostnames fall through — DNS-based blocking is out of
+    // scope for 5f. Tests and local fixtures flip
+    // `firewall.allow_private_upstreams` to bypass.
+    if !state.config.firewall.allow_private_upstreams {
+        let authority = rule
+            .upstream_authority
+            .as_deref()
+            .unwrap_or(&hostname);
+        if let Some(sa) = parse_ip_authority(authority) {
+            if is_blocked_ip(sa.ip()) {
+                state.emit(AuditEvent::Blocked {
+                    timestamp: SystemTime::now(),
+                    client_ip: Some(peer_ip),
+                    hostname: hostname.clone(),
+                    method: method.clone(),
+                    path: path.clone(),
+                    reason: format!("{BLOCK_REASON_PRIVATE_UPSTREAM} ({authority})"),
+                });
+                return Ok(error_response(
+                    StatusCode::BAD_GATEWAY,
+                    &format!(
+                        "firewall blocked upstream authority {authority} for rule {}",
+                        rule.hostname
+                    ),
+                ));
+            }
+        }
+    }
 
     let upstream_req = build_upstream_request(req, &rule, &credential, &hostname)?;
     let resp = match state.upstream.request(upstream_req).await {
@@ -454,6 +486,7 @@ mod tests {
             rules: vec![],
             bind: "127.0.0.1:0".parse().unwrap(),
             on_miss: MissPolicy::Reject,
+            firewall: Default::default(),
         };
         let (addr, fut) = bind(config, store, None).await.unwrap();
         let handle = tokio::spawn(fut);
@@ -481,6 +514,7 @@ mod tests {
             }],
             bind: "127.0.0.1:0".parse().unwrap(),
             on_miss: MissPolicy::Reject,
+            firewall: Default::default(),
         };
         let (addr, fut) = bind(config, store, None).await.unwrap();
         let handle = tokio::spawn(fut);
@@ -488,6 +522,74 @@ mod tests {
         let response = raw_get(addr, "api.anthropic.com", "/v1/x").await.unwrap();
         assert!(response.starts_with("HTTP/1.1 502"), "got: {response}");
         assert!(response.contains("credential anthropic:ANTHROPIC_API_KEY not configured"));
+
+        handle.abort();
+    }
+
+    /// 5f firewall: a rule whose `upstream_authority` is a loopback IP
+    /// literal must be rejected with 502 and a `Blocked` audit event
+    /// under the default (restrictive) firewall policy — even when the
+    /// matching credential *is* present. This proves an agent can't
+    /// misuse a mis-authored rule to route traffic back at the host.
+    #[tokio::test]
+    async fn firewall_blocks_loopback_upstream_authority() {
+        let store = Arc::new(MemoryCredentialStore::new());
+        store
+            .set("anthropic", "ANTHROPIC_API_KEY", "sk-real-secret")
+            .unwrap();
+
+        let rule = AuthRule {
+            hostname: "api.anthropic.com".into(),
+            provider_id: "anthropic".into(),
+            env_key: "ANTHROPIC_API_KEY".into(),
+            header_name: "x-api-key".into(),
+            header_format: "{key}".into(),
+            strip_headers: vec![],
+            upstream_scheme: "http".into(),
+            // Pointed at loopback — should never go out, regardless of
+            // whether anything is listening.
+            upstream_authority: Some("127.0.0.1:9".into()),
+        };
+        let config = AuthGatewayConfig {
+            rules: vec![rule],
+            bind: "127.0.0.1:0".parse().unwrap(),
+            on_miss: MissPolicy::Reject,
+            // Default — firewall on.
+            firewall: Default::default(),
+        };
+
+        let (tx, mut rx) = tokio::sync::broadcast::channel::<AuditEvent>(16);
+        let (addr, fut) = bind(config, store, Some(tx)).await.unwrap();
+        let handle = tokio::spawn(fut);
+
+        let response = raw_get(addr, "api.anthropic.com", "/v1/messages")
+            .await
+            .unwrap();
+        assert!(
+            response.starts_with("HTTP/1.1 502"),
+            "expected 502, got: {response}"
+        );
+        assert!(
+            response.contains("firewall blocked upstream authority 127.0.0.1:9"),
+            "response missing firewall reason: {response}"
+        );
+
+        // The audit channel should have emitted exactly one Blocked event
+        // whose reason names the firewall.
+        let event = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
+            .await
+            .expect("audit event did not arrive")
+            .expect("audit channel closed");
+        match event {
+            AuditEvent::Blocked { reason, hostname, .. } => {
+                assert_eq!(hostname, "api.anthropic.com");
+                assert!(
+                    reason.contains("firewall"),
+                    "reason not firewall-tagged: {reason}"
+                );
+            }
+            other => panic!("expected Blocked event, got {other:?}"),
+        }
 
         handle.abort();
     }
@@ -542,6 +644,10 @@ mod tests {
             rules: vec![rule],
             bind: "127.0.0.1:0".parse().unwrap(),
             on_miss: MissPolicy::Reject,
+            // Fake upstream lives on 127.0.0.1 — let the firewall allow it.
+            firewall: FirewallPolicy {
+                allow_private_upstreams: true,
+            },
         };
         let (gateway_addr, fut) = bind(config, store, None).await.unwrap();
         let gateway_handle = tokio::spawn(fut);
