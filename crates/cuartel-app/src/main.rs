@@ -6,6 +6,7 @@ mod permission_prompt;
 mod session_host;
 mod sidebar;
 mod sidecar_host;
+mod tab_bar;
 mod theme;
 mod workspace;
 

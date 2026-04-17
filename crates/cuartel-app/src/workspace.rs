@@ -1,5 +1,6 @@
 use crate::diff_view::{DiffView, ReviewApply};
 use crate::permission_prompt::PermissionPrompt;
+use crate::tab_bar::TabBar;
 use crate::theme::Theme;
 use cuartel_core::session::SessionState;
 use cuartel_terminal::TerminalView;
@@ -21,11 +22,10 @@ pub enum WorkspaceTab {
 }
 
 pub struct WorkspaceView {
+    tab_bar: Entity<TabBar>,
     terminal: Entity<TerminalView>,
     diff_view: Entity<DiffView>,
     permission_prompt: Entity<PermissionPrompt>,
-    label: SharedString,
-    agent: SharedString,
     prompt_text: String,
     session_state: SessionState,
     active_tab: WorkspaceTab,
@@ -36,25 +36,24 @@ pub struct WorkspaceView {
 
 impl WorkspaceView {
     pub fn new(
-        label: impl Into<SharedString>,
-        agent: impl Into<SharedString>,
+        tab_bar: Entity<TabBar>,
         terminal: Entity<TerminalView>,
         diff_view: Entity<DiffView>,
         permission_prompt: Entity<PermissionPrompt>,
         cx: &mut Context<Self>,
     ) -> Self {
         let observer = cx.observe(&permission_prompt, |_, _, cx| cx.notify());
-        let review_sub = cx.subscribe(&diff_view, |this: &mut Self, _dv, event: &ReviewApply, cx| {
-            cx.emit(event.clone());
-            let _ = this;
-        });
+        let review_sub =
+            cx.subscribe(&diff_view, |this: &mut Self, _dv, event: &ReviewApply, cx| {
+                cx.emit(event.clone());
+                let _ = this;
+            });
         let focus_handle = cx.focus_handle();
         Self {
+            tab_bar,
             terminal,
             diff_view,
             permission_prompt,
-            label: label.into(),
-            agent: agent.into(),
             prompt_text: String::new(),
             session_state: SessionState::Created,
             active_tab: WorkspaceTab::Terminal,
@@ -64,22 +63,30 @@ impl WorkspaceView {
         }
     }
 
+    pub fn swap_views(
+        &mut self,
+        terminal: Entity<TerminalView>,
+        diff_view: Entity<DiffView>,
+        permission_prompt: Entity<PermissionPrompt>,
+        cx: &mut Context<Self>,
+    ) {
+        self.terminal = terminal;
+        self.diff_view = diff_view.clone();
+        self.permission_prompt = permission_prompt.clone();
+        self._observer = cx.observe(&permission_prompt, |_, _, cx| cx.notify());
+        self._review_sub =
+            cx.subscribe(&diff_view, |this: &mut Self, _dv, event: &ReviewApply, cx| {
+                cx.emit(event.clone());
+                let _ = this;
+            });
+        cx.notify();
+    }
+
     fn set_tab(&mut self, tab: WorkspaceTab, cx: &mut Context<Self>) {
         if self.active_tab == tab {
             return;
         }
         self.active_tab = tab;
-        cx.notify();
-    }
-
-    pub fn set_active_session(
-        &mut self,
-        label: SharedString,
-        agent: SharedString,
-        cx: &mut Context<Self>,
-    ) {
-        self.label = label;
-        self.agent = agent;
         cx.notify();
     }
 
@@ -226,12 +233,15 @@ impl Render for WorkspaceView {
             .flex_1()
             .bg(rgb(theme.bg_primary))
             .font_family("IBM Plex Sans")
+            // Session tab bar
+            .child(self.tab_bar.clone())
+            // Terminal / Review mode tabs
             .child(
                 div()
                     .flex()
                     .items_center()
                     .gap_2()
-                    .h(px(36.0))
+                    .h(px(32.0))
                     .bg(rgb(theme.bg_secondary))
                     .border_b_1()
                     .border_color(rgb(theme.border))
@@ -239,33 +249,9 @@ impl Render for WorkspaceView {
                     .child(
                         div()
                             .flex()
-                            .items_center()
-                            .gap_2()
-                            .px_3()
-                            .py_1()
-                            .rounded_md()
-                            .bg(rgb(theme.bg_primary))
-                            .child(
-                                div()
-                                    .text_sm()
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .text_color(rgb(theme.text_primary))
-                                    .child(self.label.clone()),
-                            )
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(rgb(theme.text_muted))
-                                    .child(self.agent.clone()),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .flex()
                             .flex_row()
                             .items_center()
                             .gap_1()
-                            .ml_2()
                             .child(tab_button(
                                 "tab-terminal",
                                 "Terminal".into(),
