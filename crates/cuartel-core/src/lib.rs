@@ -3,6 +3,7 @@ pub mod auth_gateway;
 pub mod availability;
 pub mod checkpoint;
 pub mod config;
+pub mod fork;
 pub mod credential_store;
 pub mod diff_render;
 pub mod onboarding;

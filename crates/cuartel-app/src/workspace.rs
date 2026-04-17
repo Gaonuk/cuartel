@@ -2,6 +2,7 @@ use crate::diff_view::{DiffView, ReviewApply};
 use crate::permission_prompt::PermissionPrompt;
 use crate::tab_bar::TabBar;
 use crate::theme::Theme;
+use crate::timeline_view::{CheckpointDelete, CheckpointFork, CheckpointRestore, TimelineView};
 use cuartel_core::session::SessionState;
 use cuartel_terminal::TerminalView;
 use gpui::prelude::FluentBuilder;
@@ -14,17 +15,22 @@ pub struct PromptSubmitted {
 
 impl EventEmitter<PromptSubmitted> for WorkspaceView {}
 impl EventEmitter<ReviewApply> for WorkspaceView {}
+impl EventEmitter<CheckpointRestore> for WorkspaceView {}
+impl EventEmitter<CheckpointFork> for WorkspaceView {}
+impl EventEmitter<CheckpointDelete> for WorkspaceView {}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WorkspaceTab {
     Terminal,
     Review,
+    Timeline,
 }
 
 pub struct WorkspaceView {
     tab_bar: Entity<TabBar>,
     terminal: Entity<TerminalView>,
     diff_view: Entity<DiffView>,
+    timeline_view: Entity<TimelineView>,
     permission_prompt: Entity<PermissionPrompt>,
     prompt_text: String,
     session_state: SessionState,
@@ -32,6 +38,9 @@ pub struct WorkspaceView {
     focus_handle: FocusHandle,
     _observer: Subscription,
     _review_sub: Subscription,
+    _timeline_restore_sub: Subscription,
+    _timeline_fork_sub: Subscription,
+    _timeline_delete_sub: Subscription,
 }
 
 impl WorkspaceView {
@@ -39,6 +48,7 @@ impl WorkspaceView {
         tab_bar: Entity<TabBar>,
         terminal: Entity<TerminalView>,
         diff_view: Entity<DiffView>,
+        timeline_view: Entity<TimelineView>,
         permission_prompt: Entity<PermissionPrompt>,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -48,11 +58,24 @@ impl WorkspaceView {
                 cx.emit(event.clone());
                 let _ = this;
             });
+        let timeline_restore_sub =
+            cx.subscribe(&timeline_view, |_this: &mut Self, _tv, event: &CheckpointRestore, cx| {
+                cx.emit(event.clone());
+            });
+        let timeline_fork_sub =
+            cx.subscribe(&timeline_view, |_this: &mut Self, _tv, event: &CheckpointFork, cx| {
+                cx.emit(event.clone());
+            });
+        let timeline_delete_sub =
+            cx.subscribe(&timeline_view, |_this: &mut Self, _tv, event: &CheckpointDelete, cx| {
+                cx.emit(event.clone());
+            });
         let focus_handle = cx.focus_handle();
         Self {
             tab_bar,
             terminal,
             diff_view,
+            timeline_view,
             permission_prompt,
             prompt_text: String::new(),
             session_state: SessionState::Created,
@@ -60,6 +83,9 @@ impl WorkspaceView {
             focus_handle,
             _observer: observer,
             _review_sub: review_sub,
+            _timeline_restore_sub: timeline_restore_sub,
+            _timeline_fork_sub: timeline_fork_sub,
+            _timeline_delete_sub: timeline_delete_sub,
         }
     }
 
@@ -67,17 +93,31 @@ impl WorkspaceView {
         &mut self,
         terminal: Entity<TerminalView>,
         diff_view: Entity<DiffView>,
+        timeline_view: Entity<TimelineView>,
         permission_prompt: Entity<PermissionPrompt>,
         cx: &mut Context<Self>,
     ) {
         self.terminal = terminal;
         self.diff_view = diff_view.clone();
+        self.timeline_view = timeline_view.clone();
         self.permission_prompt = permission_prompt.clone();
         self._observer = cx.observe(&permission_prompt, |_, _, cx| cx.notify());
         self._review_sub =
             cx.subscribe(&diff_view, |this: &mut Self, _dv, event: &ReviewApply, cx| {
                 cx.emit(event.clone());
                 let _ = this;
+            });
+        self._timeline_restore_sub =
+            cx.subscribe(&timeline_view, |_this: &mut Self, _tv, event: &CheckpointRestore, cx| {
+                cx.emit(event.clone());
+            });
+        self._timeline_fork_sub =
+            cx.subscribe(&timeline_view, |_this: &mut Self, _tv, event: &CheckpointFork, cx| {
+                cx.emit(event.clone());
+            });
+        self._timeline_delete_sub =
+            cx.subscribe(&timeline_view, |_this: &mut Self, _tv, event: &CheckpointDelete, cx| {
+                cx.emit(event.clone());
             });
         cx.notify();
     }
@@ -183,6 +223,12 @@ impl Render for WorkspaceView {
         } else {
             SharedString::from("Review")
         };
+        let timeline_count = self.timeline_view.read(cx).len();
+        let timeline_label = if timeline_count > 0 {
+            SharedString::from(format!("Timeline ({timeline_count})"))
+        } else {
+            SharedString::from("Timeline")
+        };
 
         let tab_button = |id: &'static str,
                           label: SharedString,
@@ -224,6 +270,11 @@ impl Render for WorkspaceView {
                 .min_h_0()
                 .child(self.diff_view.clone())
                 .into_any_element(),
+            WorkspaceTab::Timeline => div()
+                .flex_1()
+                .min_h_0()
+                .child(self.timeline_view.clone())
+                .into_any_element(),
         };
 
         div()
@@ -263,6 +314,13 @@ impl Render for WorkspaceView {
                                 "tab-review",
                                 review_label,
                                 WorkspaceTab::Review,
+                                &theme,
+                                cx,
+                            ))
+                            .child(tab_button(
+                                "tab-timeline",
+                                timeline_label,
+                                WorkspaceTab::Timeline,
                                 &theme,
                                 cx,
                             )),

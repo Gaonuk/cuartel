@@ -9,6 +9,7 @@ mod sidebar;
 mod sidecar_host;
 mod tab_bar;
 mod theme;
+mod timeline_view;
 mod workspace;
 
 use app::CuartelApp;
