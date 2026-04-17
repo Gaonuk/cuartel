@@ -4,6 +4,7 @@ pub mod event_decode;
 pub mod events;
 pub mod filesystem;
 pub mod sidecar;
+pub mod workflow;
 
 pub use checkpoints::{CheckpointRecord, CreateCheckpointOptions, RestoreCheckpointOptions};
 pub use client::{
@@ -25,3 +26,4 @@ pub use events::{
     EVENT_SESSION_EVENT, EVENT_SHELL_DATA, EVENT_VM_BOOTED, EVENT_VM_SHUTDOWN,
 };
 pub use sidecar::Sidecar;
+pub use workflow::{StartWorkflowRequest, WorkflowRecord, WorkflowSignal};
