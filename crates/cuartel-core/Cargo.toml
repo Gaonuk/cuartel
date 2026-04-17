@@ -17,6 +17,13 @@ tokio = { workspace = true }
 dirs = { workspace = true }
 async-trait = { workspace = true }
 keyring = { workspace = true }
+hyper = { workspace = true }
+hyper-util = { workspace = true }
+hyper-rustls = { workspace = true }
+http-body-util = { workspace = true }
+bytes = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"
+reqwest = { workspace = true }
+futures = { workspace = true }

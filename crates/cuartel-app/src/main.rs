@@ -16,7 +16,8 @@ mod workspace;
 
 use app::CuartelApp;
 use assets::Assets;
-use cuartel_core::agent::HarnessRegistry;
+use cuartel_core::agent::{AgentType, HarnessRegistry};
+use cuartel_core::auth_gateway::{AuthGatewayConfig, GatewayHost, DUMMY_API_KEY};
 use cuartel_core::config::AppConfig;
 use cuartel_core::credential_store::{
     env_for_harness, CredentialStore, KeychainCredentialStore, MemoryCredentialStore,
@@ -25,11 +26,18 @@ use cuartel_core::onboarding::OnboardingConfig;
 use cuartel_db::Database;
 use cuartel_remote::{local_base_url, ServerRegistry, TailscaleClient};
 use gpui::*;
-use sidecar_host::{default_rivet_dir, SidecarHost};
+use sidecar_host::{build_shared_runtime, default_rivet_dir, SidecarHost};
 use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::sync::{Arc, Mutex as StdMutex};
+use std::time::Duration;
 
 const RIVET_PORT: u16 = 6420;
+
+/// How long main waits for the gateway to bind before falling back to
+/// direct-credential sidecar env. The bind is a loopback listen + rustls
+/// root-cert load; on a healthy machine it completes in tens of ms.
+const GATEWAY_READY_TIMEOUT: Duration = Duration::from_secs(3);
 
 fn main() {
     env_logger::init();
@@ -44,13 +52,39 @@ fn main() {
         OnboardingConfig::default()
     });
 
+    // Shared tokio runtime powering both the auth gateway and the rivet
+    // sidecar. Built first so the gateway can bind before we assemble the
+    // sidecar env — the gateway's ephemeral port has to be known before the
+    // Node.js child process is spawned, since rivetkit-started subprocesses
+    // inherit env at spawn time and we can't mutate it after.
+    let runtime = build_shared_runtime();
+
+    // Phase 5c: spawn the auth gateway first. On Ready, we swap the real
+    // credential for a dummy (DUMMY_API_KEY) in the sidecar env and inject
+    // {PROVIDER}_BASE_URL=http://127.0.0.1:<port> so agent SDKs route
+    // through the gateway. The gateway looks up the real key on the host
+    // per-request and injects it into the outgoing upstream request.
+    let gateway: &'static GatewayHost = Box::leak(Box::new(GatewayHost::spawn(
+        runtime.clone(),
+        credentials.clone(),
+        AuthGatewayConfig::with_default_rules(),
+    )));
+    let gateway_addr = gateway.wait_until_ready(GATEWAY_READY_TIMEOUT);
+    if gateway_addr.is_none() {
+        log::warn!(
+            "auth gateway did not reach Ready within {:?}; falling back to direct credentials in sidecar env (keys will be visible to agent subprocesses)",
+            GATEWAY_READY_TIMEOUT,
+        );
+    }
+
     // Task 3l: assemble env vars for the default harness (if any) so the
     // rivetkit server — and the agent-os subprocess it spawns — inherit
-    // the credentials the user configured in onboarding. Without this,
-    // Pi/Claude/etc. crash with "Agent process exited" because their
-    // required API keys are absent from the child env.
+    // the credentials (or, when the gateway is up, the dummy + base URL)
+    // the user configured in onboarding. Without this, Pi/Claude/etc.
+    // crash with "Agent process exited" because their required API keys
+    // are absent from the child env.
     let sidecar_env: HashMap<String, String> = match onboarding.default_harness.as_ref() {
-        Some(agent) => env_for_harness(&registry, credentials.as_ref(), agent),
+        Some(agent) => build_sidecar_env(&registry, credentials.as_ref(), agent, gateway_addr),
         None => HashMap::new(),
     };
     if sidecar_env.is_empty() {
@@ -65,6 +99,7 @@ fn main() {
     // Leak so the sidecar host lives for the entire app lifetime without
     // requiring a Send + 'static move into GPUI's run closure.
     let sidecar: &'static SidecarHost = Box::leak(Box::new(SidecarHost::spawn(
+        runtime,
         default_rivet_dir(),
         RIVET_PORT,
         sidecar_env.clone(),
@@ -151,6 +186,42 @@ fn build_server_registry(
     let registry = ServerRegistry::new(db, tailscale);
     registry.ensure_local(&local_base_url(rivet_port))?;
     Ok(registry)
+}
+
+/// Assemble the env map handed to the rivet sidecar.
+///
+/// When the gateway is up and the default harness is Claude Code, rewrite
+/// `ANTHROPIC_API_KEY` to the gateway's dummy sentinel and add
+/// `ANTHROPIC_BASE_URL=http://<gateway>` so the Claude Agent SDK routes
+/// through the gateway (real key stays on the host, injected per-request
+/// by auth_gateway::proxy).
+///
+/// For other harnesses (Pi, Codex, OpenCode) we do NOT rewrite the env
+/// yet: the plan is to validate Claude Code end-to-end first and then
+/// extend per-harness once we confirm the SDK respects `*_BASE_URL`.
+/// Falling back to direct credentials keeps those harnesses working in
+/// the meantime.
+fn build_sidecar_env(
+    registry: &HarnessRegistry,
+    store: &dyn CredentialStore,
+    agent: &AgentType,
+    gateway_addr: Option<SocketAddr>,
+) -> HashMap<String, String> {
+    let mut env = env_for_harness(registry, store, agent);
+
+    match (agent, gateway_addr) {
+        (AgentType::ClaudeCode, Some(addr)) => {
+            let base_url = format!("http://{addr}");
+            env.insert("ANTHROPIC_API_KEY".to_string(), DUMMY_API_KEY.to_string());
+            env.insert("ANTHROPIC_BASE_URL".to_string(), base_url);
+            log::info!(
+                "sidecar env: Claude Code routed through auth gateway at {addr}"
+            );
+        }
+        _ => {}
+    }
+
+    env
 }
 
 /// Build a credential store. Prefers the system keychain (task 3k) but
