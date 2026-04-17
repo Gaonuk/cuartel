@@ -1,4 +1,4 @@
-use crate::diff_view::DiffView;
+use crate::diff_view::{DiffView, ReviewApply};
 use crate::permission_prompt::PermissionPrompt;
 use crate::theme::Theme;
 use cuartel_core::session::SessionState;
@@ -12,6 +12,7 @@ pub struct PromptSubmitted {
 }
 
 impl EventEmitter<PromptSubmitted> for WorkspaceView {}
+impl EventEmitter<ReviewApply> for WorkspaceView {}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WorkspaceTab {
@@ -30,6 +31,7 @@ pub struct WorkspaceView {
     active_tab: WorkspaceTab,
     focus_handle: FocusHandle,
     _observer: Subscription,
+    _review_sub: Subscription,
 }
 
 impl WorkspaceView {
@@ -42,6 +44,10 @@ impl WorkspaceView {
         cx: &mut Context<Self>,
     ) -> Self {
         let observer = cx.observe(&permission_prompt, |_, _, cx| cx.notify());
+        let review_sub = cx.subscribe(&diff_view, |this: &mut Self, _dv, event: &ReviewApply, cx| {
+            cx.emit(event.clone());
+            let _ = this;
+        });
         let focus_handle = cx.focus_handle();
         Self {
             terminal,
@@ -54,6 +60,7 @@ impl WorkspaceView {
             active_tab: WorkspaceTab::Terminal,
             focus_handle,
             _observer: observer,
+            _review_sub: review_sub,
         }
     }
 

@@ -1,4 +1,4 @@
-use crate::diff_view::{fixture_diffs, DiffView};
+use crate::diff_view::{fixture_diffs, DiffView, ReviewApply};
 use crate::onboarding_view::{OnboardingCompleted, OnboardingView};
 use crate::permission_prompt::{PermissionDecision, PermissionPrompt};
 use crate::session_host::{SessionHost, SessionStateChange};
@@ -10,6 +10,7 @@ use chrono::Utc;
 use cuartel_core::agent::{AgentType, HarnessRegistry};
 use cuartel_core::credential_store::CredentialStore;
 use cuartel_core::onboarding::OnboardingConfig;
+use cuartel_core::review;
 use cuartel_core::session::SessionState;
 use cuartel_rivet::client::RivetClient;
 use cuartel_terminal::TerminalView;
@@ -26,12 +27,14 @@ const SESSION_AGENT: AgentType = AgentType::Pi;
 pub struct CuartelApp {
     sidebar: Entity<Sidebar>,
     workspace: Entity<WorkspaceView>,
+    diff_view: Entity<DiffView>,
     #[allow(dead_code)]
     permission_prompt: Entity<PermissionPrompt>,
     session_host: Entity<SessionHost>,
     onboarding_view: Option<Entity<OnboardingView>>,
     onboarding_config: OnboardingConfig,
     data_dir: PathBuf,
+    workspace_path: Option<PathBuf>,
 }
 
 impl CuartelApp {
@@ -102,6 +105,7 @@ impl CuartelApp {
         cx.subscribe(&workspace, Self::on_prompt_submitted).detach();
         cx.subscribe(&permission_prompt, Self::on_permission_decision)
             .detach();
+        cx.subscribe(&workspace, Self::on_review_apply).detach();
 
         let onboarding_view = if !onboarding_config.completed {
             let initial_default = onboarding_config.default_harness.clone();
@@ -116,11 +120,13 @@ impl CuartelApp {
         Self {
             sidebar,
             workspace,
+            diff_view,
             permission_prompt,
             session_host,
             onboarding_view,
             onboarding_config,
             data_dir,
+            workspace_path: None,
         }
     }
 
@@ -191,6 +197,41 @@ impl CuartelApp {
         self.session_host.update(cx, |host, _cx| {
             host.decide(id, approve);
         });
+    }
+
+    fn on_review_apply(
+        &mut self,
+        _view: Entity<WorkspaceView>,
+        event: &ReviewApply,
+        _cx: &mut Context<Self>,
+    ) {
+        let host_root = match &self.workspace_path {
+            Some(p) => p.clone(),
+            None => {
+                log::warn!("[review] no workspace path set — cannot apply review");
+                return;
+            }
+        };
+        let diffs: Vec<_> = self.diff_view.read(_cx).diffs().to_vec();
+        let decisions = event.decisions.clone();
+        match review::plan_review(&diffs, &decisions, &host_root) {
+            Ok(plan) => match review::execute_review(&plan, &host_root) {
+                Ok(report) => {
+                    log::info!(
+                        "[review] applied: {} written, {} deleted, {} skipped",
+                        report.files_written,
+                        report.files_deleted,
+                        report.files_skipped,
+                    );
+                }
+                Err(e) => log::error!("[review] execute failed: {e}"),
+            },
+            Err(e) => log::error!("[review] plan failed: {e}"),
+        }
+    }
+
+    pub fn set_workspace_path(&mut self, path: PathBuf) {
+        self.workspace_path = Some(path);
     }
 }
 
