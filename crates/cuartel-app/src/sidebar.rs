@@ -18,6 +18,9 @@ pub struct SessionSelected {
     pub agent: SharedString,
 }
 
+#[derive(Clone, Debug)]
+pub struct SettingsRequested;
+
 pub struct Sidebar {
     sessions: Vec<SessionItem>,
     selected_index: Option<usize>,
@@ -27,6 +30,7 @@ pub struct Sidebar {
 }
 
 impl EventEmitter<SessionSelected> for Sidebar {}
+impl EventEmitter<SettingsRequested> for Sidebar {}
 
 #[derive(Clone)]
 pub struct SessionItem {
@@ -235,6 +239,36 @@ impl Render for Sidebar {
                                     ),
                             )
                     }),
+            )
+            .child(
+                // Settings button
+                div()
+                    .id("settings-btn")
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .border_t_1()
+                    .border_color(rgb(theme.border))
+                    .px_3()
+                    .py_2()
+                    .cursor_pointer()
+                    .hover(|s| s.bg(rgb(theme.bg_hover)))
+                    .on_click(cx.listener(|this, _evt, _win, cx| {
+                        let _ = this;
+                        cx.emit(SettingsRequested);
+                    }))
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(rgb(theme.text_muted))
+                            .child("\u{2699}"),
+                    )
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(rgb(theme.text_secondary))
+                            .child("Settings"),
+                    ),
             )
     }
 }

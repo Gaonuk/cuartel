@@ -4,6 +4,7 @@ mod diff_view;
 mod onboarding_view;
 mod permission_prompt;
 mod session_host;
+mod settings_view;
 mod sidebar;
 mod sidecar_host;
 mod tab_bar;

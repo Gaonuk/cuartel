@@ -2,7 +2,8 @@ use crate::diff_view::{fixture_diffs, DiffView, ReviewApply};
 use crate::onboarding_view::{OnboardingCompleted, OnboardingView};
 use crate::permission_prompt::{PermissionDecision, PermissionPrompt};
 use crate::session_host::{SessionHost, SessionHostConfig, SessionStateChange};
-use crate::sidebar::{SessionItem, SessionSelected, Sidebar};
+use crate::settings_view::{SettingsDismissed, SettingsView};
+use crate::sidebar::{SessionItem, SessionSelected, SettingsRequested, Sidebar};
 use crate::sidecar_host::SidecarStatus;
 use crate::tab_bar::{NewTabRequested, TabBar, TabCloseRequested, TabInfo, TabSelected};
 use crate::theme::Theme;
@@ -49,6 +50,9 @@ pub struct CuartelApp {
     runtime_handle: Handle,
     sidecar_env: HashMap<String, String>,
     onboarding_view: Option<Entity<OnboardingView>>,
+    settings_view: Option<Entity<SettingsView>>,
+    registry: Arc<HarnessRegistry>,
+    credentials: Arc<dyn CredentialStore>,
     onboarding_config: OnboardingConfig,
     data_dir: PathBuf,
     workspace_path: Option<PathBuf>,
@@ -143,6 +147,7 @@ impl CuartelApp {
         });
 
         cx.subscribe(&sidebar, Self::on_session_selected).detach();
+        cx.subscribe(&sidebar, Self::on_settings_requested).detach();
         cx.subscribe(&workspace, Self::on_prompt_submitted).detach();
         cx.subscribe(&workspace, Self::on_review_apply).detach();
         cx.subscribe(&tab_bar, Self::on_tab_selected).detach();
@@ -151,8 +156,10 @@ impl CuartelApp {
 
         let onboarding_view = if !onboarding_config.completed {
             let initial_default = onboarding_config.default_harness.clone();
+            let reg = registry.clone();
+            let creds = credentials.clone();
             let ov =
-                cx.new(move |cx| OnboardingView::new(registry, credentials, initial_default, cx));
+                cx.new(move |cx| OnboardingView::new(reg, creds, initial_default, cx));
             cx.subscribe(&ov, Self::on_onboarding_completed).detach();
             Some(ov)
         } else {
@@ -171,6 +178,9 @@ impl CuartelApp {
             runtime_handle,
             sidecar_env,
             onboarding_view,
+            settings_view: None,
+            registry,
+            credentials,
             onboarding_config,
             data_dir,
             workspace_path: None,
@@ -368,6 +378,41 @@ impl CuartelApp {
         cx.notify();
     }
 
+    fn on_settings_requested(
+        &mut self,
+        _sidebar: Entity<Sidebar>,
+        _event: &SettingsRequested,
+        cx: &mut Context<Self>,
+    ) {
+        let registry = self.registry.clone();
+        let credentials = self.credentials.clone();
+        let current_default = self.onboarding_config.default_harness.clone();
+        let sv = cx.new(move |cx| SettingsView::new(registry, credentials, current_default, cx));
+        cx.subscribe(&sv, Self::on_settings_dismissed).detach();
+        self.settings_view = Some(sv);
+        cx.notify();
+    }
+
+    fn on_settings_dismissed(
+        &mut self,
+        _view: Entity<SettingsView>,
+        event: &SettingsDismissed,
+        cx: &mut Context<Self>,
+    ) {
+        if event.default_harness != self.onboarding_config.default_harness {
+            self.onboarding_config.default_harness = event.default_harness.clone();
+            if let Err(e) = self.onboarding_config.save(&self.data_dir) {
+                log::warn!("failed to persist settings change: {e}");
+            }
+            log::info!(
+                "settings: default_harness changed to {:?}",
+                self.onboarding_config.default_harness,
+            );
+        }
+        self.settings_view = None;
+        cx.notify();
+    }
+
     fn on_session_selected(
         &mut self,
         _sidebar: Entity<Sidebar>,
@@ -485,6 +530,7 @@ impl Render for CuartelApp {
             .child(self.sidebar.clone())
             .child(self.workspace.clone())
             .children(self.onboarding_view.clone())
+            .children(self.settings_view.clone())
     }
 }
 
