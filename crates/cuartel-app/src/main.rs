@@ -22,6 +22,7 @@ use cuartel_core::auth_gateway::{
     spawn_audit_persister, AuditSink, AuthGatewayConfig, DatabaseAuditSink, GatewayHost,
     DUMMY_API_KEY,
 };
+use cuartel_core::firewall::NetworkPolicy;
 use cuartel_core::config::AppConfig;
 use cuartel_core::credential_store::{
     env_for_harness, CredentialStore, KeychainCredentialStore, MemoryCredentialStore,
@@ -85,10 +86,25 @@ fn main() {
     // {PROVIDER}_BASE_URL=http://127.0.0.1:<port> so agent SDKs route
     // through the gateway. The gateway looks up the real key on the host
     // per-request and injects it into the outgoing upstream request.
+    let auth_config = AuthGatewayConfig::with_default_rules();
+
+    // Phase 5f: validate the gateway config against the firewall policy
+    // before spawning. A misconfigured gateway (Passthrough or non-loopback
+    // bind) would let VMs reach credential storage directly.
+    if let firewall_verdict @ cuartel_core::firewall::FirewallVerdict::Deny { .. } =
+        NetworkPolicy::validate_gateway_config(&auth_config)
+    {
+        log::error!(
+            "auth gateway config violates firewall policy: {firewall_verdict}; \
+             refusing to start with an unsafe configuration"
+        );
+        std::process::exit(1);
+    }
+
     let gateway: &'static GatewayHost = Box::leak(Box::new(GatewayHost::spawn(
         runtime.clone(),
         credentials.clone(),
-        AuthGatewayConfig::with_default_rules(),
+        auth_config,
     )));
     let gateway_addr = gateway.wait_until_ready(GATEWAY_READY_TIMEOUT);
     if gateway_addr.is_none() {
@@ -97,6 +113,11 @@ fn main() {
             GATEWAY_READY_TIMEOUT,
         );
     }
+
+    // Phase 5f: build the network policy so the app layer can validate
+    // port forwards against the protected endpoint set.
+    let db_path = shared_db.as_ref().map(|_| data_dir.join("cuartel.db"));
+    let firewall_policy = Arc::new(NetworkPolicy::new(gateway_addr, RIVET_PORT, db_path));
 
     // Phase 5d: subscribe to the gateway's audit broadcast channel before
     // the sidecar is up (earliest possible moment) so no events from the
@@ -156,6 +177,7 @@ fn main() {
     let data_dir_for_app = data_dir.clone();
     let env_for_app = sidecar_env;
     let server_registry_for_app = server_registry.clone();
+    let firewall_for_app = firewall_policy.clone();
 
     Application::new()
         .with_assets(Assets)
@@ -173,6 +195,7 @@ fn main() {
             let onboarding = onboarding_for_app.clone();
             let data_dir = data_dir_for_app.clone();
             let server_registry = server_registry_for_app.clone();
+            let firewall = firewall_for_app.clone();
             cx.open_window(
                 WindowOptions {
                     window_bounds: Some(WindowBounds::Windowed(bounds)),
@@ -194,6 +217,7 @@ fn main() {
                             data_dir,
                             env_for_app,
                             server_registry,
+                            firewall,
                             cx,
                         )
                     })
