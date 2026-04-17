@@ -53,9 +53,18 @@ pub fn run_migrations(conn: &Connection) -> Result<()> {
         CREATE TABLE IF NOT EXISTS checkpoints (
             id TEXT PRIMARY KEY,
             session_id TEXT NOT NULL REFERENCES sessions(id),
+            rivet_checkpoint_id TEXT,
+            parent_checkpoint_id TEXT REFERENCES checkpoints(id),
             label TEXT,
-            created_at TEXT NOT NULL DEFAULT (datetime('now'))
+            metadata TEXT NOT NULL DEFAULT '{}',
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            updated_at TEXT NOT NULL DEFAULT (datetime('now'))
         );
+
+        CREATE INDEX IF NOT EXISTS checkpoints_session_idx
+            ON checkpoints(session_id);
+        CREATE INDEX IF NOT EXISTS checkpoints_created_idx
+            ON checkpoints(session_id, created_at);
         ",
     )?;
     Ok(())
