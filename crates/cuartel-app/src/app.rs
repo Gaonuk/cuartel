@@ -14,6 +14,7 @@ use crate::workspace::{PromptSubmitted, WorkspaceView};
 use chrono::Utc;
 use cuartel_core::agent::{AgentType, HarnessRegistry};
 use cuartel_core::credential_store::CredentialStore;
+use cuartel_core::firewall::NetworkPolicy;
 use cuartel_core::onboarding::OnboardingConfig;
 use cuartel_core::review;
 use cuartel_core::session::SessionState;
@@ -64,6 +65,7 @@ pub struct CuartelApp {
     workspace_path: Option<PathBuf>,
     server_registry: Option<Arc<ServerRegistry>>,
     _server_registry_host: Option<ServerRegistryHost>,
+    firewall: Arc<NetworkPolicy>,
     #[allow(dead_code)] // Read by 7e session routing.
     active_server_id: String,
 }
@@ -80,6 +82,7 @@ impl CuartelApp {
         data_dir: PathBuf,
         sidecar_env: HashMap<String, String>,
         server_registry: Option<Arc<ServerRegistry>>,
+        firewall: Arc<NetworkPolicy>,
         cx: &mut Context<Self>,
     ) -> Self {
         let server_registry_host = server_registry
@@ -225,6 +228,7 @@ impl CuartelApp {
             workspace_path: None,
             server_registry,
             _server_registry_host: server_registry_host,
+            firewall,
             active_server_id: cuartel_db::servers::LOCAL_SERVER_ID.to_string(),
         }
     }
@@ -703,7 +707,6 @@ impl CuartelApp {
         cx: &mut Context<Self>,
     ) {
         let slot = self.active_slot();
-        let id = format!("pf-{}", uuid::Uuid::new_v4());
         log::info!(
             "[ports] add requested: session={} {} sandbox:{} host:{}",
             slot.id,
@@ -711,6 +714,20 @@ impl CuartelApp {
             event.sandbox_port,
             event.host_port,
         );
+
+        // Phase 5f: check the firewall policy before creating the forward.
+        let fw_config = cuartel_rivet::network::PortForwardConfig {
+            direction: event.direction,
+            sandbox_port: event.sandbox_port,
+            host_port: event.host_port,
+        };
+        let verdict = self.firewall.check_port_forward(&fw_config);
+        if verdict.is_denied() {
+            log::warn!("[ports] firewall denied port forward: {verdict}");
+            return;
+        }
+
+        let id = format!("pf-{}", uuid::Uuid::new_v4());
         // TODO: call rivet_client.add_port_forward once the sidecar exposes
         // the action. For now, update the panel optimistically so the UI
         // flow is exercisable.
