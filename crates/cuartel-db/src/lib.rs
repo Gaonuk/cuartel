@@ -2,6 +2,7 @@ pub mod audit;
 pub mod checkpoints;
 pub mod credentials;
 pub mod crypto;
+pub mod port_forwards;
 pub mod schema;
 pub mod servers;
 pub mod sessions;

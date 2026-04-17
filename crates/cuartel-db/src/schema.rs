@@ -129,6 +129,19 @@ pub fn run_migrations(conn: &Connection) -> Result<()> {
         CREATE INDEX IF NOT EXISTS workflow_executions_state_idx
             ON workflow_executions(state);
 
+        CREATE TABLE IF NOT EXISTS port_forwards (
+            id TEXT PRIMARY KEY,
+            session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+            direction TEXT NOT NULL CHECK (direction IN ('sandbox_to_host', 'host_to_sandbox')),
+            sandbox_port INTEGER NOT NULL,
+            host_port INTEGER NOT NULL,
+            enabled INTEGER NOT NULL DEFAULT 1,
+            created_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+
+        CREATE INDEX IF NOT EXISTS port_forwards_session_idx
+            ON port_forwards(session_id);
+
         CREATE TABLE IF NOT EXISTS audit_events (
             id TEXT PRIMARY KEY,
             kind TEXT NOT NULL,

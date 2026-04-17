@@ -3,6 +3,7 @@ mod assets;
 mod diff_view;
 mod onboarding_view;
 mod permission_prompt;
+mod ports_panel;
 mod server_registry_host;
 mod session_host;
 mod settings_view;

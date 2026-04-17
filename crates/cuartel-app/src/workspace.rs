@@ -1,5 +1,6 @@
 use crate::diff_view::{DiffView, ReviewApply};
 use crate::permission_prompt::PermissionPrompt;
+use crate::ports_panel::{PortForwardAdd, PortForwardRemove, PortForwardToggle, PortsPanel};
 use crate::tab_bar::TabBar;
 use crate::theme::Theme;
 use crate::timeline_view::{CheckpointDelete, CheckpointFork, CheckpointRestore, TimelineView};
@@ -18,12 +19,16 @@ impl EventEmitter<ReviewApply> for WorkspaceView {}
 impl EventEmitter<CheckpointRestore> for WorkspaceView {}
 impl EventEmitter<CheckpointFork> for WorkspaceView {}
 impl EventEmitter<CheckpointDelete> for WorkspaceView {}
+impl EventEmitter<PortForwardAdd> for WorkspaceView {}
+impl EventEmitter<PortForwardRemove> for WorkspaceView {}
+impl EventEmitter<PortForwardToggle> for WorkspaceView {}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WorkspaceTab {
     Terminal,
     Review,
     Timeline,
+    Ports,
 }
 
 pub struct WorkspaceView {
@@ -31,6 +36,7 @@ pub struct WorkspaceView {
     terminal: Entity<TerminalView>,
     diff_view: Entity<DiffView>,
     timeline_view: Entity<TimelineView>,
+    ports_panel: Entity<PortsPanel>,
     permission_prompt: Entity<PermissionPrompt>,
     prompt_text: String,
     session_state: SessionState,
@@ -41,6 +47,9 @@ pub struct WorkspaceView {
     _timeline_restore_sub: Subscription,
     _timeline_fork_sub: Subscription,
     _timeline_delete_sub: Subscription,
+    _port_add_sub: Subscription,
+    _port_remove_sub: Subscription,
+    _port_toggle_sub: Subscription,
 }
 
 impl WorkspaceView {
@@ -49,6 +58,7 @@ impl WorkspaceView {
         terminal: Entity<TerminalView>,
         diff_view: Entity<DiffView>,
         timeline_view: Entity<TimelineView>,
+        ports_panel: Entity<PortsPanel>,
         permission_prompt: Entity<PermissionPrompt>,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -70,12 +80,25 @@ impl WorkspaceView {
             cx.subscribe(&timeline_view, |_this: &mut Self, _tv, event: &CheckpointDelete, cx| {
                 cx.emit(event.clone());
             });
+        let port_add_sub =
+            cx.subscribe(&ports_panel, |_this: &mut Self, _pp, event: &PortForwardAdd, cx| {
+                cx.emit(event.clone());
+            });
+        let port_remove_sub =
+            cx.subscribe(&ports_panel, |_this: &mut Self, _pp, event: &PortForwardRemove, cx| {
+                cx.emit(event.clone());
+            });
+        let port_toggle_sub =
+            cx.subscribe(&ports_panel, |_this: &mut Self, _pp, event: &PortForwardToggle, cx| {
+                cx.emit(event.clone());
+            });
         let focus_handle = cx.focus_handle();
         Self {
             tab_bar,
             terminal,
             diff_view,
             timeline_view,
+            ports_panel,
             permission_prompt,
             prompt_text: String::new(),
             session_state: SessionState::Created,
@@ -86,6 +109,9 @@ impl WorkspaceView {
             _timeline_restore_sub: timeline_restore_sub,
             _timeline_fork_sub: timeline_fork_sub,
             _timeline_delete_sub: timeline_delete_sub,
+            _port_add_sub: port_add_sub,
+            _port_remove_sub: port_remove_sub,
+            _port_toggle_sub: port_toggle_sub,
         }
     }
 
@@ -94,12 +120,14 @@ impl WorkspaceView {
         terminal: Entity<TerminalView>,
         diff_view: Entity<DiffView>,
         timeline_view: Entity<TimelineView>,
+        ports_panel: Entity<PortsPanel>,
         permission_prompt: Entity<PermissionPrompt>,
         cx: &mut Context<Self>,
     ) {
         self.terminal = terminal;
         self.diff_view = diff_view.clone();
         self.timeline_view = timeline_view.clone();
+        self.ports_panel = ports_panel.clone();
         self.permission_prompt = permission_prompt.clone();
         self._observer = cx.observe(&permission_prompt, |_, _, cx| cx.notify());
         self._review_sub =
@@ -117,6 +145,18 @@ impl WorkspaceView {
             });
         self._timeline_delete_sub =
             cx.subscribe(&timeline_view, |_this: &mut Self, _tv, event: &CheckpointDelete, cx| {
+                cx.emit(event.clone());
+            });
+        self._port_add_sub =
+            cx.subscribe(&ports_panel, |_this: &mut Self, _pp, event: &PortForwardAdd, cx| {
+                cx.emit(event.clone());
+            });
+        self._port_remove_sub =
+            cx.subscribe(&ports_panel, |_this: &mut Self, _pp, event: &PortForwardRemove, cx| {
+                cx.emit(event.clone());
+            });
+        self._port_toggle_sub =
+            cx.subscribe(&ports_panel, |_this: &mut Self, _pp, event: &PortForwardToggle, cx| {
                 cx.emit(event.clone());
             });
         cx.notify();
@@ -229,6 +269,12 @@ impl Render for WorkspaceView {
         } else {
             SharedString::from("Timeline")
         };
+        let ports_count = self.ports_panel.read(cx).len();
+        let ports_label = if ports_count > 0 {
+            SharedString::from(format!("Ports ({ports_count})"))
+        } else {
+            SharedString::from("Ports")
+        };
 
         let tab_button = |id: &'static str,
                           label: SharedString,
@@ -274,6 +320,11 @@ impl Render for WorkspaceView {
                 .flex_1()
                 .min_h_0()
                 .child(self.timeline_view.clone())
+                .into_any_element(),
+            WorkspaceTab::Ports => div()
+                .flex_1()
+                .min_h_0()
+                .child(self.ports_panel.clone())
                 .into_any_element(),
         };
 
@@ -321,6 +372,13 @@ impl Render for WorkspaceView {
                                 "tab-timeline",
                                 timeline_label,
                                 WorkspaceTab::Timeline,
+                                &theme,
+                                cx,
+                            ))
+                            .child(tab_button(
+                                "tab-ports",
+                                ports_label,
+                                WorkspaceTab::Ports,
                                 &theme,
                                 cx,
                             )),
