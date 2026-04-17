@@ -17,7 +17,10 @@ mod workspace;
 use app::CuartelApp;
 use assets::Assets;
 use cuartel_core::agent::{AgentType, HarnessRegistry};
-use cuartel_core::auth_gateway::{AuthGatewayConfig, GatewayHost, DUMMY_API_KEY};
+use cuartel_core::auth_gateway::{
+    spawn_audit_persister, AuditSink, AuthGatewayConfig, DatabaseAuditSink, GatewayHost,
+    DUMMY_API_KEY,
+};
 use cuartel_core::config::AppConfig;
 use cuartel_core::credential_store::{
     env_for_harness, CredentialStore, KeychainCredentialStore, MemoryCredentialStore,
@@ -29,6 +32,7 @@ use gpui::*;
 use sidecar_host::{build_shared_runtime, default_rivet_dir, SidecarHost};
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::path::Path;
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
@@ -59,6 +63,22 @@ fn main() {
     // inherit env at spawn time and we can't mutate it after.
     let runtime = build_shared_runtime();
 
+    // Shared SQLite handle used by the server registry (phase 7) and the
+    // audit persister (phase 5d). Opened once so both subsystems operate on
+    // the same connection — WAL mode + a single process-wide mutex keep
+    // writes serialized without any extra coordination. Failure here is
+    // non-fatal: we log and continue with both features disabled so the app
+    // still boots on a broken filesystem.
+    let shared_db: Option<Arc<StdMutex<Database>>> = match open_shared_db(&data_dir) {
+        Ok(db) => Some(db),
+        Err(e) => {
+            log::warn!(
+                "shared database unavailable ({e}); server registry and audit log disabled"
+            );
+            None
+        }
+    };
+
     // Phase 5c: spawn the auth gateway first. On Ready, we swap the real
     // credential for a dummy (DUMMY_API_KEY) in the sidecar env and inject
     // {PROVIDER}_BASE_URL=http://127.0.0.1:<port> so agent SDKs route
@@ -76,6 +96,16 @@ fn main() {
             GATEWAY_READY_TIMEOUT,
         );
     }
+
+    // Phase 5d: subscribe to the gateway's audit broadcast channel before
+    // the sidecar is up (earliest possible moment) so no events from the
+    // first few requests are lost. The persister drains asynchronously; if
+    // it falls behind, the channel's 256-slot backlog logs a Lagged warning
+    // rather than back-pressuring the gateway.
+    let _audit_persister = shared_db.as_ref().map(|db| {
+        let sink: Arc<dyn AuditSink> = Arc::new(DatabaseAuditSink::new(Arc::clone(db)));
+        spawn_audit_persister(&runtime, gateway.subscribe_audit(), sink)
+    });
 
     // Task 3l: assemble env vars for the default harness (if any) so the
     // rivetkit server — and the agent-os subprocess it spawns — inherit
@@ -105,17 +135,19 @@ fn main() {
         sidecar_env.clone(),
     )));
 
-    // Phase 7: persistent server registry backed by the same SQLite DB the
-    // rest of the app will eventually share. Falls back to "no registry" on
-    // IO failure so the app still boots — the sidebar will render the live
-    // sidecar status like it did pre-phase-7.
-    let server_registry = match build_server_registry(&data_dir, RIVET_PORT) {
-        Ok(reg) => Some(Arc::new(reg)),
-        Err(e) => {
-            log::warn!("server registry unavailable ({e}); continuing without it");
-            None
+    // Phase 7: persistent server registry backed by the shared DB opened
+    // above. If the DB failed to open we simply skip the registry — the
+    // sidebar falls back to rendering the live sidecar status like it did
+    // pre-phase-7.
+    let server_registry = shared_db.as_ref().and_then(|db| {
+        match build_server_registry(Arc::clone(db), RIVET_PORT) {
+            Ok(reg) => Some(Arc::new(reg)),
+            Err(e) => {
+                log::warn!("server registry unavailable ({e}); continuing without it");
+                None
+            }
         }
-    };
+    });
 
     let registry_for_app = registry.clone();
     let credentials_for_app = credentials.clone();
@@ -170,18 +202,26 @@ fn main() {
         });
 }
 
-/// Open the shared SQLite DB and seed the `local` row so the sidebar has
-/// something to render on the very first launch.
-fn build_server_registry(
-    data_dir: &std::path::Path,
-    rivet_port: u16,
-) -> anyhow::Result<ServerRegistry> {
+/// Open the app-wide SQLite database under `data_dir/cuartel.db`. Creates
+/// the directory if missing and runs pending migrations. The handle is
+/// wrapped in a `StdMutex` because `rusqlite::Connection` is `Send` but not
+/// `Sync` — every caller that needs to write goes through the mutex.
+fn open_shared_db(data_dir: &Path) -> anyhow::Result<Arc<StdMutex<Database>>> {
     let db_path = data_dir.join("cuartel.db");
     if let Some(parent) = db_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
     let db = Database::open(&db_path)?;
-    let db = Arc::new(StdMutex::new(db));
+    Ok(Arc::new(StdMutex::new(db)))
+}
+
+/// Wire up the server registry on top of the shared DB + a Tailscale
+/// client, and seed the built-in `local` row so the sidebar has something
+/// to render on the very first launch.
+fn build_server_registry(
+    db: Arc<StdMutex<Database>>,
+    rivet_port: u16,
+) -> anyhow::Result<ServerRegistry> {
     let tailscale = Arc::new(TailscaleClient::new());
     let registry = ServerRegistry::new(db, tailscale);
     registry.ensure_local(&local_base_url(rivet_port))?;
