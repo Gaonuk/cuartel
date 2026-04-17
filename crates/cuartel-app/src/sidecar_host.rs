@@ -4,7 +4,6 @@ use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::thread;
 use tokio::runtime::{Handle, Runtime};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -22,8 +21,27 @@ pub struct SidecarHost {
     handle: Handle,
 }
 
+/// Build the shared tokio runtime and leak it so worker threads stay alive
+/// for the entire app lifetime. The returned `Handle` is passed to
+/// `SidecarHost::spawn` and `GatewayHost::spawn` (and anything else that
+/// needs to schedule async work) so the process runs on a single pool.
+pub fn build_shared_runtime() -> Handle {
+    let rt: Runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .worker_threads(2)
+        .thread_name("cuartel-tokio")
+        .build()
+        .expect("failed to build tokio runtime");
+    let handle = rt.handle().clone();
+    // Leak: the multi-threaded runtime owns its worker threads; dropping
+    // the `Runtime` would shut them down. We want them alive for the
+    // whole process, so we deliberately forget the value.
+    Box::leak(Box::new(rt));
+    handle
+}
+
 impl SidecarHost {
-    /// Spawn the rivet sidecar process on a dedicated tokio runtime.
+    /// Spawn the rivet sidecar on the provided tokio `Handle`.
     ///
     /// `env` is forwarded verbatim to `Command::new("npx").env(...)` before
     /// the child is started (task 3l). Typical usage: pass the credentials
@@ -31,57 +49,50 @@ impl SidecarHost {
     /// server — and by extension every agent-os subprocess it spawns —
     /// inherits them. Environment changes after spawn are not respected;
     /// restart the sidecar to pick up new vars.
-    pub fn spawn(rivet_dir: PathBuf, port: u16, env: HashMap<String, String>) -> Self {
+    pub fn spawn(
+        handle: Handle,
+        rivet_dir: PathBuf,
+        port: u16,
+        env: HashMap<String, String>,
+    ) -> Self {
         let status = Arc::new(Mutex::new(SidecarStatus::Idle));
         let client = Arc::new(Mutex::new(None));
 
-        // Build the tokio runtime synchronously so the handle is usable
-        // immediately — SessionHost needs it before the sidecar is ready.
-        let rt: Runtime = tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .worker_threads(2)
-            .thread_name("cuartel-tokio")
-            .build()
-            .expect("failed to build tokio runtime");
-        let handle = rt.handle().clone();
-
         let status_bg = status.clone();
         let client_bg = client.clone();
-        thread::Builder::new()
-            .name("cuartel-sidecar".into())
-            .spawn(move || {
-                rt.block_on(async move {
-                    let mut sidecar = Sidecar::new(rivet_dir, port);
-                    sidecar.set_env(env);
+        handle.spawn(async move {
+            let mut sidecar = Sidecar::new(rivet_dir, port);
+            sidecar.set_env(env);
 
-                    *status_bg.lock() = SidecarStatus::Installing;
-                    if let Err(e) = sidecar.ensure_deps_installed().await {
-                        log::error!("rivet deps install failed: {e}");
-                        *status_bg.lock() = SidecarStatus::Failed(format!("npm install: {e}"));
-                        std::future::pending::<()>().await;
-                        return;
-                    }
+            *status_bg.lock() = SidecarStatus::Installing;
+            if let Err(e) = sidecar.ensure_deps_installed().await {
+                log::error!("rivet deps install failed: {e}");
+                *status_bg.lock() = SidecarStatus::Failed(format!("npm install: {e}"));
+                // Hold the Sidecar alive on this task so child-process
+                // handles aren't dropped mid-install-retry from a user's
+                // future action.
+                std::future::pending::<()>().await;
+                return;
+            }
 
-                    *status_bg.lock() = SidecarStatus::Starting;
-                    if let Err(e) = sidecar.start().await {
-                        log::error!("rivet sidecar start failed: {e}");
-                        *status_bg.lock() = SidecarStatus::Failed(format!("start: {e}"));
-                        std::future::pending::<()>().await;
-                        return;
-                    }
+            *status_bg.lock() = SidecarStatus::Starting;
+            if let Err(e) = sidecar.start().await {
+                log::error!("rivet sidecar start failed: {e}");
+                *status_bg.lock() = SidecarStatus::Failed(format!("start: {e}"));
+                std::future::pending::<()>().await;
+                return;
+            }
 
-                    let client = RivetClient::new(&format!("http://localhost:{}", port));
-                    *client_bg.lock() = Some(client.clone());
-                    *status_bg.lock() = SidecarStatus::Ready;
+            let rivet_client = RivetClient::new(&format!("http://localhost:{}", port));
+            *client_bg.lock() = Some(rivet_client.clone());
+            *status_bg.lock() = SidecarStatus::Ready;
 
-                    smoke_test(&client).await;
+            smoke_test(&rivet_client).await;
 
-                    // Keep the runtime alive so the child process + any
-                    // caller-spawned tasks keep running.
-                    std::future::pending::<()>().await;
-                });
-            })
-            .expect("failed to spawn sidecar thread");
+            // Keep the Sidecar (and therefore the Node.js child process)
+            // owned by this task for the lifetime of the runtime.
+            std::future::pending::<()>().await;
+        });
 
         Self {
             status,
@@ -98,10 +109,9 @@ impl SidecarHost {
         self.client.clone()
     }
 
-    /// Handle to the shared tokio runtime driving the sidecar. Callers may
-    /// `.spawn(future)` to run additional async work on this runtime —
-    /// notably, SessionHost uses it to drive Rivet client calls and the
-    /// event stream without needing its own runtime.
+    /// Handle to the shared tokio runtime. Callers may `.spawn(future)` to
+    /// run additional async work on this runtime — notably, SessionHost
+    /// uses it to drive Rivet client calls and the event stream.
     pub fn runtime_handle(&self) -> Handle {
         self.handle.clone()
     }
