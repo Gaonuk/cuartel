@@ -39,17 +39,22 @@ use tokio::sync::mpsc::{self, error::TryRecvError, UnboundedReceiver, UnboundedS
 
 #[derive(Clone, Debug)]
 pub struct SessionStateChange {
+    pub session_id: String,
     pub state: SessionState,
 }
 
 impl EventEmitter<SessionStateChange> for SessionHost {}
 
 const VM_ACTOR_NAME: &str = "vm";
-const VM_ACTOR_KEY: &str = "cuartel-pi-session";
-const AGENT_TYPE: &str = "pi";
-const WORKSPACE_ID: &str = "workspace-default";
 const SERVER_ID: &str = "local";
-const SESSION_LOCAL_ID: &str = "cuartel-main";
+
+#[derive(Clone, Debug)]
+pub struct SessionHostConfig {
+    pub session_id: String,
+    pub agent_type: String,
+    pub actor_key: String,
+    pub workspace_id: String,
+}
 
 /// Events forwarded from the tokio driver into the GPUI thread.
 #[derive(Debug)]
@@ -84,6 +89,7 @@ pub enum SessionHostCommand {
 }
 
 pub struct SessionHost {
+    config: SessionHostConfig,
     terminal: Entity<TerminalView>,
     permission_prompt: Entity<PermissionPrompt>,
     session: Session,
@@ -94,6 +100,7 @@ pub struct SessionHost {
 
 impl SessionHost {
     pub fn new(
+        config: SessionHostConfig,
         runtime: Handle,
         client_slot: Arc<Mutex<Option<RivetClient>>>,
         sidecar_status: Arc<Mutex<SidecarStatus>>,
@@ -105,8 +112,10 @@ impl SessionHost {
         let (event_tx, event_rx) = mpsc::unbounded_channel::<SessionHostEvent>();
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<SessionHostCommand>();
 
+        let driver_config = config.clone();
         let env_clone = env.clone();
         runtime.spawn(run_driver(
+            driver_config,
             client_slot,
             sidecar_status,
             event_tx,
@@ -144,19 +153,26 @@ impl SessionHost {
             }
         });
 
+        let session = Session::new(
+            config.session_id.clone(),
+            config.workspace_id.clone(),
+            SERVER_ID.into(),
+            config.agent_type.clone(),
+        );
+
         Self {
+            config,
             terminal,
             permission_prompt,
-            session: Session::new(
-                SESSION_LOCAL_ID.into(),
-                WORKSPACE_ID.into(),
-                SERVER_ID.into(),
-                AGENT_TYPE.into(),
-            ),
+            session,
             env,
             cmd_tx,
             _driver_task: poll_task,
         }
+    }
+
+    pub fn config(&self) -> &SessionHostConfig {
+        &self.config
     }
 
     pub fn decide(&self, id: String, approve: bool) {
@@ -211,8 +227,11 @@ impl SessionHost {
             SessionHostEvent::StateEvent(core_ev) => {
                 match self.session.apply(core_ev.clone()) {
                     Ok(state) => {
-                        log::info!("[session] state → {state}");
-                        cx.emit(SessionStateChange { state: state.clone() });
+                        log::info!("[session:{}] state → {state}", self.config.session_id);
+                        cx.emit(SessionStateChange {
+                            session_id: self.config.session_id.clone(),
+                            state: state.clone(),
+                        });
                     }
                     Err(e) => {
                         log::debug!("[session] rejected transition {core_ev:?}: {e}");
@@ -233,6 +252,7 @@ impl SessionHost {
 // --- Tokio driver --------------------------------------------------------
 
 async fn run_driver(
+    config: SessionHostConfig,
     client_slot: Arc<Mutex<Option<RivetClient>>>,
     sidecar_status: Arc<Mutex<SidecarStatus>>,
     event_tx: UnboundedSender<SessionHostEvent>,
@@ -252,11 +272,11 @@ async fn run_driver(
     };
 
     let _ = event_tx.send(SessionHostEvent::Status(
-        "provisioning vm actor (vm/cuartel-pi-session)...".into(),
+        format!("provisioning vm actor (vm/{})...", config.actor_key),
     ));
     let req = GetOrCreateRequest {
         name: VM_ACTOR_NAME,
-        key: VM_ACTOR_KEY,
+        key: &config.actor_key,
         runner_name_selector: "default",
         crash_policy: "kill",
     };
@@ -277,8 +297,6 @@ async fn run_driver(
         }
     };
 
-    // Subscribe to events BEFORE creating the session so we don't miss the
-    // early boot broadcasts.
     let _ = event_tx.send(SessionHostEvent::Status(
         "subscribing to event stream...".into(),
     ));
@@ -295,14 +313,19 @@ async fn run_driver(
         }
     };
 
-    let _ = event_tx.send(SessionHostEvent::Status("creating pi session...".into()));
+    let _ = event_tx.send(SessionHostEvent::Status(
+        format!("creating {} session...", config.agent_type),
+    ));
     let session_options = if env.is_empty() {
         None
     } else {
         log::info!("[session] createSession env: {:?}", env);
         Some(json!({ "env": env }))
     };
-    let session_rec = match client.create_session(&actor_id, AGENT_TYPE, session_options).await {
+    let session_rec = match client
+        .create_session(&actor_id, &config.agent_type, session_options)
+        .await
+    {
         Ok(r) => {
             let _ = event_tx.send(SessionHostEvent::Status(format!(
                 "session ready: {}",
