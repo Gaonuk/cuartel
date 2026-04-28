@@ -6,6 +6,7 @@ members = [
     "crates/cuartel-rivet",
     "crates/cuartel-remote",
     "crates/cuartel-db",
+    "crates/cuartel-acp",
 ]
 resolver = "2"
 
@@ -41,12 +42,15 @@ hyper-util = { version = "0.1", features = ["server", "client", "client-legacy",
 hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "ring", "native-tokio", "tls12"] }
 http-body-util = "0.1"
 bytes = "1"
+agent-client-protocol = { version = "=0.11.1", features = ["unstable"] }
+tokio-util = { version = "0.7", features = ["compat"] }
 
 cuartel-core = { path = "crates/cuartel-core" }
 cuartel-terminal = { path = "crates/cuartel-terminal" }
 cuartel-rivet = { path = "crates/cuartel-rivet" }
 cuartel-remote = { path = "crates/cuartel-remote" }
 cuartel-db = { path = "crates/cuartel-db" }
+cuartel-acp = { path = "crates/cuartel-acp" }
 
 [patch.crates-io]
 pathfinder_simd = { git = "https://github.com/PaulWagener/pathfinder", branch = "rename-simd-fmin-fmax" }
