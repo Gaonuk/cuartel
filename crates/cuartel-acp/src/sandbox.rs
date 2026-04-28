@@ -20,7 +20,7 @@ use async_trait::async_trait;
 use crate::client::{AcpClient, AcpClientOptions};
 use crate::client_handler::{ClientHandler, NoOpClientHandler};
 use crate::error::Result;
-use crate::transport::SpawnOptions;
+use crate::transport::{build_inherited_path, resolve_executable, SpawnOptions};
 
 /// Pluggable sandbox provisioner.
 ///
@@ -59,13 +59,46 @@ impl LocalSandbox {
     /// LocalSandbox preset for `claude-code-acp` via `npx`. Inherits the
     /// host process env so `~/.claude/` subscription auth (or
     /// `ANTHROPIC_API_KEY`) flows through unchanged.
+    ///
+    /// Resolves `npx` to an absolute path at construction so the spawn
+    /// works even if the calling process's `$PATH` is stripped (macOS
+    /// GUI-launched apps, GPUI processes started outside a shell, etc.).
+    /// Probe order: `CUARTEL_NPX_PATH` env var → `$PATH` → common Node
+    /// install locations (nvm, homebrew, asdf, fnm, volta, pnpm, bun).
+    /// If npx isn't found anywhere, falls back to the literal `"npx"`
+    /// string and lets the spawn-time error surface the missing binary.
+    ///
+    /// Also injects an extended `PATH` env into the spawned process so
+    /// npx can find its sibling `node` binary in the same directory
+    /// even when the parent's `$PATH` was empty.
     pub fn claude_code_acp() -> Self {
+        let resolved = resolve_executable("npx", Some("CUARTEL_NPX_PATH"));
+        let (command, env) = match resolved {
+            Some(abs) => {
+                let parent_dir = abs.parent().map(|p| p.to_path_buf());
+                let mut env = Vec::new();
+                if let Some(dir) = parent_dir.as_deref() {
+                    let inherited = build_inherited_path(&[dir]);
+                    env.push(("PATH".to_string(), inherited));
+                }
+                (abs.to_string_lossy().into_owned(), env)
+            }
+            None => {
+                log::warn!(
+                    "cuartel-acp: could not resolve npx absolute path; \
+                     spawn will rely on the spawned process's $PATH. \
+                     If you hit `No such file or directory`, set \
+                     CUARTEL_NPX_PATH=/absolute/path/to/npx",
+                );
+                ("npx".to_string(), Vec::new())
+            }
+        };
         Self {
             spawn_template: SpawnOptions {
-                command: "npx".into(),
+                command,
                 args: vec!["claude-code-acp".into()],
                 cwd: PathBuf::from("/"), // overridden per-spawn
-                env: Vec::new(),
+                env,
                 clear_env: false,
             },
         }
@@ -121,7 +154,13 @@ mod tests {
     fn local_sandbox_default_uses_claude_code_acp() {
         let sb = LocalSandbox::default();
         assert_eq!(sb.kind(), "local");
-        assert_eq!(sb.spawn_template.command, "npx");
+        // Command may be absolute (resolved npx) or literal "npx" if
+        // resolution failed; we don't assume the dev machine has npx.
+        let cmd = sb.spawn_template.command.as_str();
+        assert!(
+            cmd == "npx" || cmd.ends_with("/npx"),
+            "expected npx (literal or absolute), got {cmd:?}",
+        );
         assert_eq!(sb.spawn_template.args, vec!["claude-code-acp"]);
     }
 
