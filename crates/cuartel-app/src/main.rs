@@ -293,7 +293,26 @@ fn build_sidecar_env(
 /// falls back to an in-memory store when the keychain is unreachable — we
 /// never want the app to refuse to start because the user is on a headless
 /// machine or the keychain plugin is locked.
+///
+/// **Skipped entirely when `CUARTEL_USE_ACP=1`.** The new host-direct
+/// ACP path uses the user's existing `~/.claude/` subscription auth via
+/// the spawned `claude-code-acp` subprocess; it does not consult
+/// cuartel's keychain entry at all. Probing the keychain in that mode
+/// would surface the macOS prompt-on-every-launch problem (caused by
+/// dev-build code-signature instability) for no benefit.
 fn build_credential_store() -> Arc<dyn CredentialStore> {
+    let acp_enabled = std::env::var("CUARTEL_USE_ACP")
+        .ok()
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    if acp_enabled {
+        log::info!(
+            "credential store: in-memory (CUARTEL_USE_ACP=1; skipping keychain probe to \
+             avoid the macOS prompt-on-every-launch — claude-code-acp uses ~/.claude/ auth)"
+        );
+        return Arc::new(MemoryCredentialStore::new());
+    }
+
     let keychain = KeychainCredentialStore::new();
     // Round-trip a sentinel read to detect "no keyring available" on this
     // host. keyring::Error::NoEntry is the happy-path signal (entry is

@@ -42,6 +42,12 @@ pub struct WorkspaceView {
     session_state: SessionState,
     active_tab: WorkspaceTab,
     focus_handle: FocusHandle,
+    /// `true` until the first render() call has run window.focus() once.
+    /// Never re-set: focus changes after that go through normal click /
+    /// child-focus flow. Without this flag we focus on every render
+    /// (~60 Hz) and steal focus back from the terminal so Cmd+C
+    /// never reaches it.
+    initial_focus_pending: bool,
     _observer: Subscription,
     _review_sub: Subscription,
     _timeline_restore_sub: Subscription,
@@ -104,6 +110,11 @@ impl WorkspaceView {
             session_state: SessionState::Created,
             active_tab: WorkspaceTab::Terminal,
             focus_handle,
+            // Request focus once on first render; never again. Calling
+            // window.focus() from render every frame steals focus away
+            // from the terminal so Cmd+C never lands on the terminal's
+            // selection — that's why "select text + Cmd+C" was a no-op.
+            initial_focus_pending: true,
             _observer: observer,
             _review_sub: review_sub,
             _timeline_restore_sub: timeline_restore_sub,
@@ -254,7 +265,10 @@ impl Render for WorkspaceView {
             "Session not ready"
         };
 
-        window.focus(&self.focus_handle);
+        if self.initial_focus_pending {
+            window.focus(&self.focus_handle);
+            self.initial_focus_pending = false;
+        }
 
         let active_tab = self.active_tab;
         let review_count = self.diff_view.read(cx).len();
@@ -281,27 +295,39 @@ impl Render for WorkspaceView {
                           tab: WorkspaceTab,
                           theme: &Theme,
                           cx: &mut Context<Self>| {
+            // Underline-only active indicator. Inactive tabs use a
+            // 2px transparent bottom border so heights match exactly
+            // and the active underline doesn't shift sibling tabs by
+            // 2px when toggled. The text color carries the second
+            // signal so the active tab is unmistakable.
             let active = active_tab == tab;
-            let bg = if active { theme.bg_primary } else { theme.bg_secondary };
-            let fg = if active { theme.text_primary } else { theme.text_muted };
-            let border = if active { theme.accent } else { theme.bg_secondary };
+            let fg = if active {
+                theme.text_primary
+            } else {
+                theme.text_muted
+            };
+            // Use the same color type for both branches; transparent
+            // version of the accent keeps it Rgba-typed.
+            let underline = if active {
+                rgb(theme.accent)
+            } else {
+                rgba(0x00000000)
+            };
             div()
                 .id(id)
-                .px_3()
-                .py_1()
-                .rounded_md()
-                .bg(rgb(bg))
+                .px_4()
+                .py_2()
                 .border_b_2()
-                .border_color(rgb(border))
+                .border_color(underline)
                 .text_sm()
                 .font_weight(if active {
                     FontWeight::SEMIBOLD
                 } else {
-                    FontWeight::NORMAL
+                    FontWeight::MEDIUM
                 })
                 .text_color(rgb(fg))
                 .cursor_pointer()
-                .hover(|s| s.bg(rgb(theme.bg_hover)))
+                .hover(|s| s.text_color(rgb(theme.text_primary)))
                 .on_click(cx.listener(move |this, _evt, _win, cx| this.set_tab(tab, cx)))
                 .child(label)
         };
