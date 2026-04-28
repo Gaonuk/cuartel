@@ -38,21 +38,46 @@ use std::time::Duration;
 use tokio::runtime::Handle;
 use tokio::sync::mpsc::{self, error::TryRecvError, UnboundedReceiver, UnboundedSender};
 
-/// Feature flag for the host-direct ACP path (Phase B2 of v2 doc).
+/// Three driver variants today; selected per-session via env vars
+/// (and, in a follow-up commit, a per-session UI toggle):
 ///
-/// When `CUARTEL_USE_ACP=1` is set, [`SessionHost::new`] spawns
-/// [`run_driver_acp`] instead of the Rivet-backed [`run_driver`]. The
-/// ACP path runs `claude-code-acp` as a plain host subprocess via
-/// `cuartel-acp::LocalSandbox` — no V8, no Rivet sidecar, no AgentOS
-/// secure-exec. Same isolation tier as Zed/Polyscope/Paseo today
-/// (host-direct + permission UI as the safety net).
+///   - **`Rivet`** (default) — the existing AgentOS secure-exec V8
+///     sandbox path via `cuartel-rivet`. Untouched while the new
+///     paths shake out.
+///   - **`Acp`** (`CUARTEL_USE_ACP=1`) — host-direct
+///     `claude-code-acp` subprocess via `cuartel-acp::LocalSandbox`.
+///     Same isolation tier as Zed/Polyscope/Paseo today; tool calls
+///     surface as structured `SessionEvent`s the cuartel UI renders.
+///   - **`NativeClaudeCli`** (`CUARTEL_NATIVE_CLAUDE=1`) — bare
+///     `claude` CLI in a real PTY. Users see the full Claude Code TUI
+///     (boxes, ANSI colors, slash menus) inside cuartel's terminal
+///     view. No structured-event extraction; cuartel-terminal renders
+///     the raw bytes. Equivalent to running `claude` in a regular
+///     terminal, but in a cuartel tab.
 ///
-/// The Rivet path stays the default until the new path is shaken out;
-/// then we swap defaults and remove the Rivet path entirely.
+/// Precedence when multiple are set: NativeClaudeCli > Acp > Rivet.
 const ACP_TOGGLE_ENV: &str = "CUARTEL_USE_ACP";
+const NATIVE_CLAUDE_TOGGLE_ENV: &str = "CUARTEL_NATIVE_CLAUDE";
 
-fn acp_path_enabled() -> bool {
-    std::env::var(ACP_TOGGLE_ENV)
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AgentMode {
+    Rivet,
+    Acp,
+    NativeClaudeCli,
+}
+
+fn agent_mode_from_env() -> AgentMode {
+    if env_truthy(NATIVE_CLAUDE_TOGGLE_ENV) {
+        AgentMode::NativeClaudeCli
+    } else if env_truthy(ACP_TOGGLE_ENV) {
+        AgentMode::Acp
+    } else {
+        AgentMode::Rivet
+    }
+}
+
+fn env_truthy(var: &str) -> bool {
+    std::env::var(var)
         .ok()
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false)
@@ -164,20 +189,41 @@ impl SessionHost {
 
         let driver_config = config.clone();
         let env_clone = env.clone();
-        if acp_path_enabled() {
-            log::info!(
-                "[session_host] {ACP_TOGGLE_ENV}=1 — spawning host-direct ACP driver"
-            );
-            runtime.spawn(run_driver_acp(driver_config, event_tx, cmd_rx));
-        } else {
-            runtime.spawn(run_driver(
-                driver_config,
-                client_slot,
-                sidecar_status,
-                event_tx,
-                cmd_rx,
-                env_clone,
-            ));
+        match agent_mode_from_env() {
+            AgentMode::NativeClaudeCli => {
+                log::info!(
+                    "[session_host] {NATIVE_CLAUDE_TOGGLE_ENV}=1 — \
+                     spawning native Claude Code CLI in PTY"
+                );
+                spawn_native_claude_in_terminal(
+                    &driver_config,
+                    &terminal,
+                    &event_tx,
+                    cx,
+                );
+                // Cmd loop forwards prompt-input submissions to PTY stdin.
+                runtime.spawn(run_driver_native_claude(
+                    driver_config,
+                    event_tx,
+                    cmd_rx,
+                ));
+            }
+            AgentMode::Acp => {
+                log::info!(
+                    "[session_host] {ACP_TOGGLE_ENV}=1 — spawning host-direct ACP driver"
+                );
+                runtime.spawn(run_driver_acp(driver_config, event_tx, cmd_rx));
+            }
+            AgentMode::Rivet => {
+                runtime.spawn(run_driver(
+                    driver_config,
+                    client_slot,
+                    sidecar_status,
+                    event_tx,
+                    cmd_rx,
+                    env_clone,
+                ));
+            }
         }
 
         let poll_task = cx.spawn(async move |this, cx| {
@@ -735,5 +781,184 @@ fn translate_acp_event(
         }
         // SessionEvent is #[non_exhaustive] — keep going on unknown variants.
         _ => true,
+    }
+}
+
+// ============================================================================
+// Native Claude Code CLI driver (CUARTEL_NATIVE_CLAUDE=1).
+//
+// Spawns the bare `claude` CLI in a real PTY so users see the full
+// Claude Code TUI inside cuartel's terminal pane. No claude-code-acp
+// wrapper, no structured event extraction — equivalent to running
+// `claude` in a regular terminal but in a cuartel tab.
+//
+// Architecture:
+//   1. spawn_native_claude_in_terminal (sync, GPUI side) creates a
+//      PtySession via cuartel_terminal::PtySession::spawn_command and
+//      hands it to TerminalView::attach_pty. The terminal's existing
+//      poll task drains PTY output and the existing handle_key
+//      forwards keystrokes to PTY stdin — so a user clicking the
+//      terminal pane gets the full interactive Claude Code experience.
+//   2. run_driver_native_claude (tokio side) handles SessionHostCommand
+//      flow: emits Boot+BootCompleted state events so the prompt input
+//      box unlocks, and forwards SendPrompt(text) submissions from the
+//      input box to PTY stdin via a shared Arc<PtySession>.
+// ============================================================================
+
+use cuartel_terminal::PtySession;
+
+/// Shared between the GPUI-side spawn helper and the tokio-side
+/// command-forwarding driver. Set once at session creation;
+/// SendPrompt commands look it up to write to PTY stdin.
+static NATIVE_CLAUDE_PTYS: std::sync::OnceLock<
+    parking_lot::Mutex<std::collections::HashMap<String, std::sync::Arc<PtySession>>>,
+> = std::sync::OnceLock::new();
+
+fn native_claude_ptys()
+    -> &'static parking_lot::Mutex<std::collections::HashMap<String, std::sync::Arc<PtySession>>>
+{
+    NATIVE_CLAUDE_PTYS.get_or_init(|| parking_lot::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Resolve the absolute path to the `claude` CLI. Mirrors cuartel-acp's
+/// resolve_executable but local because we don't want cuartel-app to
+/// depend on cuartel-acp's transport internals — those are private.
+fn resolve_claude_binary() -> Option<PathBuf> {
+    if let Ok(p) = std::env::var("CUARTEL_CLAUDE_PATH") {
+        let path = PathBuf::from(p);
+        if path.is_file() {
+            return Some(path);
+        }
+    }
+    if let Some(path_var) = std::env::var_os("PATH") {
+        for dir in std::env::split_paths(&path_var) {
+            let candidate = dir.join("claude");
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+    }
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let fallbacks: Vec<PathBuf> = [
+        home.as_ref().map(|h| h.join(".local/bin/claude")),
+        home.as_ref().map(|h| h.join(".claude/local/bin/claude")),
+        home.as_ref().map(|h| h.join(".claude/bin/claude")),
+        Some(PathBuf::from("/opt/homebrew/bin/claude")),
+        Some(PathBuf::from("/usr/local/bin/claude")),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    fallbacks.into_iter().find(|p| p.is_file())
+}
+
+fn spawn_native_claude_in_terminal(
+    config: &SessionHostConfig,
+    terminal: &Entity<TerminalView>,
+    event_tx: &UnboundedSender<SessionHostEvent>,
+    cx: &mut Context<SessionHost>,
+) {
+    let cwd = match acp_session_cwd() {
+        Ok(p) => p,
+        Err(msg) => {
+            let _ = event_tx.send(SessionHostEvent::Error(msg));
+            return;
+        }
+    };
+
+    let claude_path = match resolve_claude_binary() {
+        Some(p) => p,
+        None => {
+            let _ = event_tx.send(SessionHostEvent::Error(
+                "claude CLI not found. Install with `npm install -g @anthropic-ai/claude-code` \
+                 or set CUARTEL_CLAUDE_PATH=/absolute/path/to/claude."
+                    .into(),
+            ));
+            return;
+        }
+    };
+
+    let _ = event_tx.send(SessionHostEvent::StateEvent(CoreSessionEvent::Boot));
+    let _ = event_tx.send(SessionHostEvent::Status(format!(
+        "native Claude: spawning `{}` in {}",
+        claude_path.display(),
+        cwd.display(),
+    )));
+
+    let session_arc = match PtySession::spawn_command(
+        &claude_path,
+        &[],
+        &cwd,
+        &std::collections::HashMap::new(),
+        40, // rows — TerminalView resizes the PTY on layout
+        120,
+    ) {
+        Ok(s) => std::sync::Arc::new(s),
+        Err(e) => {
+            let _ = event_tx.send(SessionHostEvent::StateEvent(
+                CoreSessionEvent::Failed(format!("PTY spawn failed: {e}")),
+            ));
+            let _ = event_tx.send(SessionHostEvent::Error(format!(
+                "failed to spawn claude in PTY: {e}"
+            )));
+            return;
+        }
+    };
+
+    native_claude_ptys()
+        .lock()
+        .insert(config.session_id.clone(), session_arc.clone());
+
+    terminal.update(cx, |t, cx| t.attach_pty(session_arc, cx));
+
+    let _ = event_tx.send(SessionHostEvent::StateEvent(CoreSessionEvent::BootCompleted));
+    let _ = event_tx.send(SessionHostEvent::Status(
+        "native Claude session ready (type into the terminal or use the prompt input)".into(),
+    ));
+}
+
+async fn run_driver_native_claude(
+    config: SessionHostConfig,
+    event_tx: UnboundedSender<SessionHostEvent>,
+    mut cmd_rx: UnboundedReceiver<SessionHostCommand>,
+) {
+    loop {
+        match cmd_rx.recv().await {
+            Some(SessionHostCommand::SendPrompt(text)) => {
+                // Forward prompt-input box submissions to PTY stdin so
+                // both the in-terminal typing AND the input box at the
+                // bottom of the workspace work in native mode.
+                let pty = native_claude_ptys()
+                    .lock()
+                    .get(&config.session_id)
+                    .cloned();
+                match pty {
+                    Some(p) => {
+                        let mut payload = text.into_bytes();
+                        payload.push(b'\n');
+                        p.write(&payload);
+                    }
+                    None => {
+                        let _ = event_tx.send(SessionHostEvent::Error(
+                            "native Claude PTY missing — session lost".into(),
+                        ));
+                        break;
+                    }
+                }
+            }
+            Some(SessionHostCommand::Decision { .. }) => {
+                // No structured permission flow in native mode — Claude
+                // Code's own CLI prompts the user inside the TUI.
+            }
+            Some(SessionHostCommand::Shutdown) => {
+                native_claude_ptys().lock().remove(&config.session_id);
+                let _ = event_tx.send(SessionHostEvent::Closed("shutdown requested".into()));
+                break;
+            }
+            None => {
+                native_claude_ptys().lock().remove(&config.session_id);
+                break;
+            }
+        }
     }
 }
