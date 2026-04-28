@@ -166,6 +166,27 @@ pub struct Spawned {
 
 /// Spawn an ACP server subprocess with stdio piped in three directions.
 pub fn spawn(opts: &SpawnOptions) -> Result<Spawned> {
+    // posix_spawn returns ENOENT (os error 2) when the cwd doesn't
+    // exist, but Rust reports it against the binary path — so a stale
+    // CUARTEL_ACP_CWD silently turns into "command not found" errors
+    // that look like missing-binary issues. Catch this case up front
+    // with a message the user can act on.
+    if !opts.cwd.is_dir() {
+        return Err(AcpError::Spawn {
+            command: format!(
+                "{} — cwd `{}` does not exist or is not a directory \
+                 (set CUARTEL_ACP_CWD to a real repo path, or unset it \
+                 to use the cuartel-app process's current dir)",
+                opts.command,
+                opts.cwd.display(),
+            ),
+            source: std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "spawn cwd missing",
+            ),
+        });
+    }
+
     let mut cmd = Command::new(&opts.command);
     cmd.args(&opts.args)
         .current_dir(&opts.cwd)
@@ -317,6 +338,38 @@ mod tests {
         if std::env::var("PATH").is_ok() {
             assert!(combined.contains(":"), "expected separator, got {combined}");
         }
+    }
+
+    #[tokio::test]
+    async fn spawn_with_missing_cwd_errors_clearly_not_blaming_the_binary() {
+        // posix_spawn returns ENOENT when cwd is missing but blames the
+        // binary path — earned that one in production. Make sure the
+        // friendly error fires before we even try to spawn.
+        let opts = SpawnOptions {
+            command: "/bin/sh".into(),
+            args: vec!["-c".into(), "true".into()],
+            cwd: PathBuf::from("/this/path/should/never/exist"),
+            env: Vec::new(),
+            clear_env: false,
+        };
+        let err = match spawn(&opts) {
+            Ok(_) => panic!("expected spawn to fail with missing cwd"),
+            Err(e) => e,
+        };
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("/this/path/should/never/exist"),
+            "error should name the missing cwd, got: {msg}",
+        );
+        assert!(
+            msg.contains("does not exist"),
+            "error should mention the cwd doesn't exist, got: {msg}",
+        );
+        // And critically — it should NOT make the binary look like the problem.
+        assert!(
+            !msg.contains("/bin/sh: No such file"),
+            "error should not blame /bin/sh; got: {msg}",
+        );
     }
 
     #[test]

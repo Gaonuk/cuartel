@@ -62,11 +62,28 @@ fn acp_path_enabled() -> bool {
 /// with `CUARTEL_ACP_CWD=/path/to/repo`. Falls back to the cuartel-app
 /// process's current dir. The full Workspace abstraction (with N
 /// worktrees + access policy) lands in Phase C3.
-fn acp_session_cwd() -> PathBuf {
-    if let Ok(p) = std::env::var("CUARTEL_ACP_CWD") {
-        return PathBuf::from(p);
+///
+/// Returns `Err(message)` when the resolved path doesn't exist as a
+/// directory — the GPUI status line shows the message so the user can
+/// fix their env var without digging through a misleading
+/// `posix_spawn ENOENT against /path/to/node` further down the stack.
+fn acp_session_cwd() -> std::result::Result<PathBuf, String> {
+    let (path, source) = match std::env::var("CUARTEL_ACP_CWD") {
+        Ok(p) => (PathBuf::from(p), "CUARTEL_ACP_CWD"),
+        Err(_) => (
+            std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/")),
+            "process cwd",
+        ),
+    };
+    if !path.is_dir() {
+        return Err(format!(
+            "ACP cwd `{}` (from {source}) does not exist as a directory. \
+             Set CUARTEL_ACP_CWD to a real repo path or unset it to use \
+             the cuartel-app process's current dir.",
+            path.display(),
+        ));
     }
-    std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"))
+    Ok(path)
 }
 
 #[derive(Clone, Debug)]
@@ -575,7 +592,13 @@ async fn run_driver_acp(
     event_tx: UnboundedSender<SessionHostEvent>,
     mut cmd_rx: UnboundedReceiver<SessionHostCommand>,
 ) {
-    let cwd = acp_session_cwd();
+    let cwd = match acp_session_cwd() {
+        Ok(p) => p,
+        Err(msg) => {
+            let _ = event_tx.send(SessionHostEvent::Error(msg));
+            return;
+        }
+    };
     let _ = event_tx.send(SessionHostEvent::Status(format!(
         "ACP path: spawning claude-code-acp in {}",
         cwd.display()
