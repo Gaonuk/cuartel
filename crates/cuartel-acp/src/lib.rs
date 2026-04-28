@@ -41,10 +41,10 @@ pub mod session;
 pub mod transport;
 
 pub use client::{AcpClient, AcpClientOptions};
-pub use client_handler::{ClientHandler, NoOpClientHandler};
+pub use client_handler::{ClientHandler, NoOpClientHandler, PermissionDecision, PermissionRequest};
 pub use error::{AcpError, Result};
 pub use normalize::{normalize_tool_name, ToolKind};
-pub use session::{SessionHandle, SessionId};
+pub use session::{SessionEvent, SessionHandle, SessionId};
 
 // Re-export the upstream schema for callers that need raw types.
 pub use agent_client_protocol::schema as acp_schema;
