@@ -23,16 +23,23 @@ pub struct AgentModeSelected {
     pub mode: AgentMode,
 }
 
+#[derive(Clone, Debug)]
+pub struct AgentTypeSelected {
+    pub agent: AgentType,
+}
+
 impl EventEmitter<TabSelected> for TabBar {}
 impl EventEmitter<NewTabRequested> for TabBar {}
 impl EventEmitter<TabCloseRequested> for TabBar {}
 impl EventEmitter<AgentModeSelected> for TabBar {}
+impl EventEmitter<AgentTypeSelected> for TabBar {}
 
 #[derive(Clone, Debug)]
 pub struct TabInfo {
     pub session_id: String,
     pub label: SharedString,
     pub agent: AgentType,
+    pub agent_mode: AgentMode,
     pub state: SessionState,
 }
 
@@ -40,15 +47,31 @@ pub struct TabBar {
     tabs: Vec<TabInfo>,
     active_id: Option<String>,
     next_agent_mode: AgentMode,
+    /// Which CLI flavor the next Native-mode session will spawn. Only
+    /// surfaced as a sub-picker when `next_agent_mode == NativeClaudeCli`;
+    /// other modes route through the harness layer and ignore this.
+    next_agent_type: AgentType,
 }
 
 impl TabBar {
-    pub fn new(initial_mode: AgentMode, _cx: &mut Context<Self>) -> Self {
+    pub fn new(
+        initial_mode: AgentMode,
+        initial_agent: AgentType,
+        _cx: &mut Context<Self>,
+    ) -> Self {
         Self {
             tabs: Vec::new(),
             active_id: None,
             next_agent_mode: initial_mode,
+            next_agent_type: initial_agent,
         }
+    }
+
+    /// Called from `CuartelApp` when the default agent changes (via
+    /// onboarding / settings) so the picker shows the new default.
+    pub fn set_next_agent_type(&mut self, agent: AgentType, cx: &mut Context<Self>) {
+        self.next_agent_type = agent;
+        cx.notify();
     }
 
     pub fn set_tabs(&mut self, tabs: Vec<TabInfo>, cx: &mut Context<Self>) {
@@ -150,6 +173,16 @@ impl Render for TabBar {
                             .text_color(rgb(theme.text_muted))
                             .child(SharedString::from(tab.agent.display_name().to_string())),
                     )
+                    .child(
+                        div()
+                            .text_xs()
+                            .px_1p5()
+                            .py_0p5()
+                            .rounded_sm()
+                            .bg(rgb(theme.bg_primary))
+                            .text_color(rgb(theme.accent))
+                            .child(SharedString::from(tab.agent_mode.short_label())),
+                    )
                     .when(can_close, |el| {
                         el.child(
                             div()
@@ -173,6 +206,11 @@ impl Render for TabBar {
             .collect();
 
         let mode_picker = render_mode_picker(self.next_agent_mode, &theme, cx);
+        let cli_picker = if self.next_agent_mode == AgentMode::NativeClaudeCli {
+            Some(render_cli_picker(self.next_agent_type.clone(), &theme, cx))
+        } else {
+            None
+        };
 
         div()
             .id("tab-bar")
@@ -199,6 +237,7 @@ impl Render for TabBar {
                     .child("+"),
             )
             .child(div().flex_1())
+            .children(cli_picker)
             .child(mode_picker)
     }
 }
@@ -259,6 +298,68 @@ fn render_mode_picker(
                 .text_color(rgb(theme.text_muted))
                 .pr_1()
                 .child("mode:"),
+        )
+        .children(segments)
+}
+
+/// CLI flavor sub-picker shown only when the mode picker is on Native.
+/// Lists every entry of [`AgentType::all_native_cli`] as a clickable
+/// segment; clicking emits `AgentTypeSelected` so `CuartelApp` can
+/// rebind `next_agent_type` for the next "+" tab.
+fn render_cli_picker(
+    current: AgentType,
+    theme: &Theme,
+    cx: &mut Context<TabBar>,
+) -> impl IntoElement {
+    let segments: Vec<AnyElement> = AgentType::all_native_cli()
+        .into_iter()
+        .map(|agent| {
+            let active = agent == current;
+            let bg = if active { theme.bg_primary } else { theme.bg_secondary };
+            let fg = if active { theme.text_primary } else { theme.text_muted };
+            let border = if active { theme.accent } else { theme.bg_secondary };
+            let id = format!("cli-{}", agent.rivet_name());
+            let agent_for_click = agent.clone();
+            div()
+                .id(ElementId::Name(SharedString::from(id).into()))
+                .px_2()
+                .py_0p5()
+                .text_xs()
+                .font_weight(if active {
+                    FontWeight::SEMIBOLD
+                } else {
+                    FontWeight::NORMAL
+                })
+                .text_color(rgb(fg))
+                .bg(rgb(bg))
+                .border_b_2()
+                .border_color(rgb(border))
+                .cursor_pointer()
+                .hover(|s| s.text_color(rgb(theme.accent)))
+                .on_click(cx.listener(move |this, _evt, _win, cx| {
+                    this.next_agent_type = agent_for_click.clone();
+                    cx.emit(AgentTypeSelected {
+                        agent: agent_for_click.clone(),
+                    });
+                    cx.notify();
+                }))
+                .child(SharedString::from(agent.short_label().to_string()))
+                .into_any_element()
+        })
+        .collect();
+
+    div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .pr_3()
+        .gap_0p5()
+        .child(
+            div()
+                .text_xs()
+                .text_color(rgb(theme.text_muted))
+                .pr_1()
+                .child("cli:"),
         )
         .children(segments)
 }

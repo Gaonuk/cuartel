@@ -19,6 +19,7 @@
 
 use crate::permission_prompt::{PendingPermission, PermissionPrompt};
 use crate::sidecar_host::SidecarStatus;
+use cuartel_core::agent::AgentType;
 use cuartel_core::session::{Session, SessionEvent as CoreSessionEvent, SessionState};
 use cuartel_rivet::client::{GetOrCreateRequest, RivetClient};
 use cuartel_rivet::event_decode::{
@@ -149,7 +150,14 @@ const SERVER_ID: &str = "local";
 #[derive(Clone, Debug)]
 pub struct SessionHostConfig {
     pub session_id: String,
+    /// Wire-format agent name passed to Rivet's `createSession` (e.g.
+    /// `"claude"`, `"pi"`). Comes from [`AgentType::rivet_name`].
     pub agent_type: String,
+    /// Typed agent identity. Used by the Native PTY mode to pick which
+    /// CLI binary to spawn (claude / codex / droid / amp / gemini …).
+    /// Defaults to [`AgentType::Custom`] of `agent_type` for legacy
+    /// callers that only fill the string field.
+    pub agent: AgentType,
     pub actor_key: String,
     pub workspace_id: String,
     /// Which driver backs this session. `None` falls back to the env-var
@@ -221,17 +229,18 @@ impl SessionHost {
         match mode {
             AgentMode::NativeClaudeCli => {
                 log::info!(
-                    "[session_host] {NATIVE_CLAUDE_TOGGLE_ENV}=1 — \
-                     spawning native Claude Code CLI in PTY"
+                    "[session_host] native CLI mode — spawning {} ({}) in PTY",
+                    driver_config.agent.display_name(),
+                    driver_config.agent.rivet_name(),
                 );
-                spawn_native_claude_in_terminal(
+                spawn_native_cli_in_terminal(
                     &driver_config,
                     &terminal,
                     &event_tx,
                     cx,
                 );
                 // Cmd loop forwards prompt-input submissions to PTY stdin.
-                runtime.spawn(run_driver_native_claude(
+                runtime.spawn(run_driver_native_cli(
                     driver_config,
                     event_tx,
                     cmd_rx,
@@ -814,24 +823,29 @@ fn translate_acp_event(
 }
 
 // ============================================================================
-// Native Claude Code CLI driver (CUARTEL_NATIVE_CLAUDE=1).
+// Native CLI driver (CUARTEL_NATIVE_CLAUDE=1, plus per-session selection).
 //
-// Spawns the bare `claude` CLI in a real PTY so users see the full
-// Claude Code TUI inside cuartel's terminal pane. No claude-code-acp
-// wrapper, no structured event extraction — equivalent to running
-// `claude` in a regular terminal but in a cuartel tab.
+// Spawns the user's chosen agent CLI — `claude`, `codex`, `pi`,
+// `opencode`, `droid`, `amp`, or `gemini` — in a real PTY so the user
+// sees its full TUI inside cuartel's terminal pane. No structured event
+// extraction; equivalent to running the CLI in a regular terminal, but
+// in a cuartel tab.
 //
 // Architecture:
-//   1. spawn_native_claude_in_terminal (sync, GPUI side) creates a
-//      PtySession via cuartel_terminal::PtySession::spawn_command and
-//      hands it to TerminalView::attach_pty. The terminal's existing
-//      poll task drains PTY output and the existing handle_key
-//      forwards keystrokes to PTY stdin — so a user clicking the
-//      terminal pane gets the full interactive Claude Code experience.
-//   2. run_driver_native_claude (tokio side) handles SessionHostCommand
-//      flow: emits Boot+BootCompleted state events so the prompt input
-//      box unlocks, and forwards SendPrompt(text) submissions from the
-//      input box to PTY stdin via a shared Arc<PtySession>.
+//   1. spawn_native_cli_in_terminal (sync, GPUI side) resolves the CLI
+//      binary, wraps it in the user's $SHELL so rc files (.zshrc /
+//      .bashrc) load and the terminal looks like the user's normal
+//      shell, then creates a PtySession via PtySession::spawn_command
+//      and hands it to TerminalView::attach_pty.
+//   2. run_driver_native_cli (tokio side) handles SessionHostCommand
+//      flow: forwards SendPrompt(text) from the prompt input to PTY
+//      stdin via a shared Arc<PtySession>.
+//
+// Shell wrapping (set CUARTEL_NATIVE_NO_SHELL=1 to disable): the CLI is
+// invoked as `$SHELL -i -c "exec <cli>"` so the user's interactive
+// shell sources their rc files first. This means PATH, aliases, prompt
+// theming, and any CLI-side shell completions all behave exactly as
+// they do when the user runs the CLI in their own terminal.
 // ============================================================================
 
 use cuartel_terminal::PtySession;
@@ -839,49 +853,151 @@ use cuartel_terminal::PtySession;
 /// Shared between the GPUI-side spawn helper and the tokio-side
 /// command-forwarding driver. Set once at session creation;
 /// SendPrompt commands look it up to write to PTY stdin.
-static NATIVE_CLAUDE_PTYS: std::sync::OnceLock<
+static NATIVE_CLI_PTYS: std::sync::OnceLock<
     parking_lot::Mutex<std::collections::HashMap<String, std::sync::Arc<PtySession>>>,
 > = std::sync::OnceLock::new();
 
-fn native_claude_ptys()
+fn native_cli_ptys()
     -> &'static parking_lot::Mutex<std::collections::HashMap<String, std::sync::Arc<PtySession>>>
 {
-    NATIVE_CLAUDE_PTYS.get_or_init(|| parking_lot::Mutex::new(std::collections::HashMap::new()))
+    NATIVE_CLI_PTYS.get_or_init(|| parking_lot::Mutex::new(std::collections::HashMap::new()))
 }
 
-/// Resolve the absolute path to the `claude` CLI. Mirrors cuartel-acp's
-/// resolve_executable but local because we don't want cuartel-app to
-/// depend on cuartel-acp's transport internals — those are private.
-fn resolve_claude_binary() -> Option<PathBuf> {
-    if let Ok(p) = std::env::var("CUARTEL_CLAUDE_PATH") {
-        let path = PathBuf::from(p);
-        if path.is_file() {
-            return Some(path);
+/// Per-CLI metadata for binary discovery + install hints. Kept local to
+/// cuartel-app — the cuartel-core harness layer is heavier (parsers,
+/// install steps, env keys) and not all native CLIs have a harness yet.
+struct NativeCliSpec {
+    /// Binary name to look up on PATH (`"claude"`, `"codex"`, …).
+    binary: &'static str,
+    /// Optional env var that, if set to a real file path, overrides the
+    /// PATH search. Lets users point cuartel at a non-standard install.
+    override_env: &'static str,
+    /// Extra `~`-relative paths to probe after PATH (homebrew, npm
+    /// per-user installs, vendor-specific install dirs).
+    home_fallbacks: &'static [&'static str],
+    /// Human-readable install hint shown in the error when the binary
+    /// can't be found. Usually a copy-paste install command.
+    install_hint: &'static str,
+}
+
+fn native_cli_spec(agent: &AgentType) -> NativeCliSpec {
+    match agent {
+        AgentType::ClaudeCode => NativeCliSpec {
+            binary: "claude",
+            override_env: "CUARTEL_CLAUDE_PATH",
+            home_fallbacks: &[
+                ".local/bin/claude",
+                ".claude/local/bin/claude",
+                ".claude/bin/claude",
+            ],
+            install_hint: "npm install -g @anthropic-ai/claude-code",
+        },
+        AgentType::Codex => NativeCliSpec {
+            binary: "codex",
+            override_env: "CUARTEL_CODEX_PATH",
+            home_fallbacks: &[".local/bin/codex"],
+            install_hint: "npm install -g @openai/codex",
+        },
+        AgentType::Pi => NativeCliSpec {
+            binary: "pi",
+            override_env: "CUARTEL_PI_PATH",
+            home_fallbacks: &[".local/bin/pi", ".pi/bin/pi"],
+            install_hint: "curl -fsSL https://pi.cuartel.dev/install.sh | sh",
+        },
+        AgentType::OpenCode => NativeCliSpec {
+            binary: "opencode",
+            override_env: "CUARTEL_OPENCODE_PATH",
+            home_fallbacks: &[".local/bin/opencode", ".opencode/bin/opencode"],
+            install_hint: "curl -fsSL https://opencode.ai/install | bash",
+        },
+        AgentType::Droid => NativeCliSpec {
+            binary: "droid",
+            override_env: "CUARTEL_DROID_PATH",
+            home_fallbacks: &[".local/bin/droid", ".factory/bin/droid"],
+            install_hint: "curl -fsSL https://app.factory.ai/cli | sh",
+        },
+        AgentType::Amp => NativeCliSpec {
+            binary: "amp",
+            override_env: "CUARTEL_AMP_PATH",
+            home_fallbacks: &[".local/bin/amp"],
+            install_hint: "npm install -g @sourcegraph/amp",
+        },
+        AgentType::Gemini => NativeCliSpec {
+            binary: "gemini",
+            override_env: "CUARTEL_GEMINI_PATH",
+            home_fallbacks: &[".local/bin/gemini"],
+            install_hint: "npm install -g @google/gemini-cli",
+        },
+        AgentType::Custom(name) => {
+            // Best-effort: no env override, no fallbacks, hint asks the
+            // user to put the binary on PATH. Custom is mainly for
+            // tests / future plugins.
+            let leaked: &'static str = Box::leak(name.clone().into_boxed_str());
+            NativeCliSpec {
+                binary: leaked,
+                override_env: "",
+                home_fallbacks: &[],
+                install_hint: "(custom agent — ensure binary is on PATH)",
+            }
+        }
+    }
+}
+
+/// Resolve the absolute path to a CLI binary by name. Search order:
+/// override env var → PATH → user-home fallbacks → system fallbacks.
+fn resolve_native_cli_binary(spec: &NativeCliSpec) -> Option<PathBuf> {
+    if !spec.override_env.is_empty() {
+        if let Ok(p) = std::env::var(spec.override_env) {
+            let path = PathBuf::from(p);
+            if path.is_file() {
+                return Some(path);
+            }
         }
     }
     if let Some(path_var) = std::env::var_os("PATH") {
         for dir in std::env::split_paths(&path_var) {
-            let candidate = dir.join("claude");
+            let candidate = dir.join(spec.binary);
             if candidate.is_file() {
                 return Some(candidate);
             }
         }
     }
     let home = std::env::var_os("HOME").map(PathBuf::from);
-    let fallbacks: Vec<PathBuf> = [
-        home.as_ref().map(|h| h.join(".local/bin/claude")),
-        home.as_ref().map(|h| h.join(".claude/local/bin/claude")),
-        home.as_ref().map(|h| h.join(".claude/bin/claude")),
-        Some(PathBuf::from("/opt/homebrew/bin/claude")),
-        Some(PathBuf::from("/usr/local/bin/claude")),
-    ]
-    .into_iter()
-    .flatten()
-    .collect();
-    fallbacks.into_iter().find(|p| p.is_file())
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    if let Some(h) = home.as_ref() {
+        for rel in spec.home_fallbacks {
+            candidates.push(h.join(rel));
+        }
+    }
+    // Standard macOS install prefixes for Homebrew + manually installed
+    // binaries. Cheap to check and covers most setups when PATH was
+    // sanitized by Finder-launched cuartel-app.
+    candidates.push(PathBuf::from(format!("/opt/homebrew/bin/{}", spec.binary)));
+    candidates.push(PathBuf::from(format!("/usr/local/bin/{}", spec.binary)));
+    candidates.into_iter().find(|p| p.is_file())
 }
 
-fn spawn_native_claude_in_terminal(
+/// Build the (program, args) pair to spawn for a given CLI binary.
+///
+/// By default wraps in `$SHELL -i -c "exec <cli>"` so the user's
+/// interactive shell sources rc files first. Set `CUARTEL_NATIVE_NO_SHELL=1`
+/// to bypass and spawn the CLI directly (debug / minimal-env mode).
+fn build_native_cli_spawn(cli_path: &std::path::Path) -> (PathBuf, Vec<String>) {
+    if env_truthy("CUARTEL_NATIVE_NO_SHELL") {
+        return (cli_path.to_path_buf(), Vec::new());
+    }
+    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".into());
+    // `exec` replaces the shell with the CLI process so closing the
+    // CLI also closes the PTY. Single-quoting the path is safe: real
+    // CLI paths never contain `'` and we already verified it `is_file`.
+    let inner = format!("exec '{}'", cli_path.display());
+    (
+        PathBuf::from(shell),
+        vec!["-i".to_string(), "-c".to_string(), inner],
+    )
+}
+
+fn spawn_native_cli_in_terminal(
     config: &SessionHostConfig,
     terminal: &Entity<TerminalView>,
     event_tx: &UnboundedSender<SessionHostEvent>,
@@ -895,28 +1011,35 @@ fn spawn_native_claude_in_terminal(
         }
     };
 
-    let claude_path = match resolve_claude_binary() {
+    let spec = native_cli_spec(&config.agent);
+    let cli_path = match resolve_native_cli_binary(&spec) {
         Some(p) => p,
         None => {
-            let _ = event_tx.send(SessionHostEvent::Error(
-                "claude CLI not found. Install with `npm install -g @anthropic-ai/claude-code` \
-                 or set CUARTEL_CLAUDE_PATH=/absolute/path/to/claude."
-                    .into(),
-            ));
+            let _ = event_tx.send(SessionHostEvent::Error(format!(
+                "{} CLI not found. Install with `{}` or set {}=/absolute/path/to/{}.",
+                config.agent.display_name(),
+                spec.install_hint,
+                spec.override_env,
+                spec.binary,
+            )));
             return;
         }
     };
 
+    let (program, args) = build_native_cli_spawn(&cli_path);
+
     let _ = event_tx.send(SessionHostEvent::StateEvent(CoreSessionEvent::Boot));
     let _ = event_tx.send(SessionHostEvent::Status(format!(
-        "native Claude: spawning `{}` in {}",
-        claude_path.display(),
+        "native {}: spawning `{}` in {} (via {})",
+        config.agent.display_name(),
+        cli_path.display(),
         cwd.display(),
+        program.display(),
     )));
 
     let session_arc = match PtySession::spawn_command(
-        &claude_path,
-        &[],
+        &program,
+        &args,
         &cwd,
         &std::collections::HashMap::new(),
         40, // rows — TerminalView resizes the PTY on layout
@@ -928,25 +1051,27 @@ fn spawn_native_claude_in_terminal(
                 CoreSessionEvent::Failed(format!("PTY spawn failed: {e}")),
             ));
             let _ = event_tx.send(SessionHostEvent::Error(format!(
-                "failed to spawn claude in PTY: {e}"
+                "failed to spawn {} in PTY: {e}",
+                spec.binary,
             )));
             return;
         }
     };
 
-    native_claude_ptys()
+    native_cli_ptys()
         .lock()
         .insert(config.session_id.clone(), session_arc.clone());
 
     terminal.update(cx, |t, cx| t.attach_pty(session_arc, cx));
 
     let _ = event_tx.send(SessionHostEvent::StateEvent(CoreSessionEvent::BootCompleted));
-    let _ = event_tx.send(SessionHostEvent::Status(
-        "native Claude session ready (type into the terminal or use the prompt input)".into(),
-    ));
+    let _ = event_tx.send(SessionHostEvent::Status(format!(
+        "native {} session ready (type into the terminal or use the prompt input)",
+        config.agent.display_name(),
+    )));
 }
 
-async fn run_driver_native_claude(
+async fn run_driver_native_cli(
     config: SessionHostConfig,
     event_tx: UnboundedSender<SessionHostEvent>,
     mut cmd_rx: UnboundedReceiver<SessionHostCommand>,
@@ -957,7 +1082,7 @@ async fn run_driver_native_claude(
                 // Forward prompt-input box submissions to PTY stdin so
                 // both the in-terminal typing AND the input box at the
                 // bottom of the workspace work in native mode.
-                let pty = native_claude_ptys()
+                let pty = native_cli_ptys()
                     .lock()
                     .get(&config.session_id)
                     .cloned();
@@ -969,23 +1094,23 @@ async fn run_driver_native_claude(
                     }
                     None => {
                         let _ = event_tx.send(SessionHostEvent::Error(
-                            "native Claude PTY missing — session lost".into(),
+                            "native CLI PTY missing — session lost".into(),
                         ));
                         break;
                     }
                 }
             }
             Some(SessionHostCommand::Decision { .. }) => {
-                // No structured permission flow in native mode — Claude
-                // Code's own CLI prompts the user inside the TUI.
+                // No structured permission flow in native mode — the
+                // CLI's own TUI prompts the user.
             }
             Some(SessionHostCommand::Shutdown) => {
-                native_claude_ptys().lock().remove(&config.session_id);
+                native_cli_ptys().lock().remove(&config.session_id);
                 let _ = event_tx.send(SessionHostEvent::Closed("shutdown requested".into()));
                 break;
             }
             None => {
-                native_claude_ptys().lock().remove(&config.session_id);
+                native_cli_ptys().lock().remove(&config.session_id);
                 break;
             }
         }
