@@ -66,6 +66,30 @@ pub enum AgentMode {
     NativeClaudeCli,
 }
 
+impl AgentMode {
+    /// Compact label for the tab-bar mode picker.
+    pub fn short_label(self) -> &'static str {
+        match self {
+            AgentMode::Rivet => "Rivet",
+            AgentMode::Acp => "ACP",
+            AgentMode::NativeClaudeCli => "Native",
+        }
+    }
+
+    pub const ALL: [AgentMode; 3] = [
+        AgentMode::Rivet,
+        AgentMode::Acp,
+        AgentMode::NativeClaudeCli,
+    ];
+
+    /// Initial default sourced from env vars at process start. Used by
+    /// `CuartelApp` to seed `next_agent_mode`; the per-session UI picker
+    /// overrides on subsequent session creations.
+    pub fn from_env() -> Self {
+        agent_mode_from_env()
+    }
+}
+
 fn agent_mode_from_env() -> AgentMode {
     if env_truthy(NATIVE_CLAUDE_TOGGLE_ENV) {
         AgentMode::NativeClaudeCli
@@ -128,6 +152,10 @@ pub struct SessionHostConfig {
     pub agent_type: String,
     pub actor_key: String,
     pub workspace_id: String,
+    /// Which driver backs this session. `None` falls back to the env-var
+    /// resolution from [`AgentMode::from_env`] for callers that haven't
+    /// been migrated to the per-session picker yet.
+    pub agent_mode: Option<AgentMode>,
 }
 
 /// Events forwarded from the tokio driver into the GPUI thread.
@@ -189,7 +217,8 @@ impl SessionHost {
 
         let driver_config = config.clone();
         let env_clone = env.clone();
-        match agent_mode_from_env() {
+        let mode = driver_config.agent_mode.unwrap_or_else(agent_mode_from_env);
+        match mode {
             AgentMode::NativeClaudeCli => {
                 log::info!(
                     "[session_host] {NATIVE_CLAUDE_TOGGLE_ENV}=1 — \

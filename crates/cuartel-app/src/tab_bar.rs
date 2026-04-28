@@ -1,3 +1,4 @@
+use crate::session_host::AgentMode;
 use crate::theme::Theme;
 use cuartel_core::agent::AgentType;
 use cuartel_core::session::SessionState;
@@ -17,9 +18,15 @@ pub struct TabCloseRequested {
     pub session_id: String,
 }
 
+#[derive(Clone, Debug)]
+pub struct AgentModeSelected {
+    pub mode: AgentMode,
+}
+
 impl EventEmitter<TabSelected> for TabBar {}
 impl EventEmitter<NewTabRequested> for TabBar {}
 impl EventEmitter<TabCloseRequested> for TabBar {}
+impl EventEmitter<AgentModeSelected> for TabBar {}
 
 #[derive(Clone, Debug)]
 pub struct TabInfo {
@@ -32,13 +39,15 @@ pub struct TabInfo {
 pub struct TabBar {
     tabs: Vec<TabInfo>,
     active_id: Option<String>,
+    next_agent_mode: AgentMode,
 }
 
 impl TabBar {
-    pub fn new(_cx: &mut Context<Self>) -> Self {
+    pub fn new(initial_mode: AgentMode, _cx: &mut Context<Self>) -> Self {
         Self {
             tabs: Vec::new(),
             active_id: None,
+            next_agent_mode: initial_mode,
         }
     }
 
@@ -163,6 +172,8 @@ impl Render for TabBar {
             })
             .collect();
 
+        let mode_picker = render_mode_picker(self.next_agent_mode, &theme, cx);
+
         div()
             .id("tab-bar")
             .flex()
@@ -187,7 +198,69 @@ impl Render for TabBar {
                     }))
                     .child("+"),
             )
+            .child(div().flex_1())
+            .child(mode_picker)
     }
+}
+
+/// Right-aligned 3-segment button group. The selected mode applies to
+/// the next session created via the "+" tab button. Click any segment
+/// to rebind; the change is local until session creation.
+fn render_mode_picker(
+    current: AgentMode,
+    theme: &Theme,
+    cx: &mut Context<TabBar>,
+) -> impl IntoElement {
+    let segments: Vec<AnyElement> = AgentMode::ALL
+        .iter()
+        .map(|mode| {
+            let mode = *mode;
+            let active = mode == current;
+            let bg = if active { theme.bg_primary } else { theme.bg_secondary };
+            let fg = if active { theme.text_primary } else { theme.text_muted };
+            let border = if active { theme.accent } else { theme.bg_secondary };
+            div()
+                .id(ElementId::Name(
+                    SharedString::from(format!("mode-{}", mode.short_label())).into(),
+                ))
+                .px_2()
+                .py_0p5()
+                .text_xs()
+                .font_weight(if active {
+                    FontWeight::SEMIBOLD
+                } else {
+                    FontWeight::NORMAL
+                })
+                .text_color(rgb(fg))
+                .bg(rgb(bg))
+                .border_b_2()
+                .border_color(rgb(border))
+                .cursor_pointer()
+                .hover(|s| s.text_color(rgb(theme.accent)))
+                .on_click(cx.listener(move |this, _evt, _win, cx| {
+                    this.next_agent_mode = mode;
+                    cx.emit(AgentModeSelected { mode });
+                    cx.notify();
+                }))
+                .child(SharedString::from(mode.short_label()))
+                .into_any_element()
+        })
+        .collect();
+
+    div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .pr_2()
+        .gap_0p5()
+        .child(
+            div()
+                .text_xs()
+                .text_color(rgb(theme.text_muted))
+                .pr_1()
+                .child("mode:"),
+        )
+        .children(segments)
 }
 
 fn state_dot(state: &SessionState, theme: &Theme) -> (u32, &'static str) {
