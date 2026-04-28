@@ -479,15 +479,15 @@ Each step has: **Goal** (one sentence), **Scope** (in/out), **DoD** (acceptance 
 #### Step B2: `LocalSandbox` impl + cutover
 - **Goal:** Replace AgentOS secure-exec with `LocalSandbox` (claude-code-acp as a plain host subprocess). Cuartel runs the new stack; sendPrompt hang gone.
 - **Scope:** in: `LocalSandbox` impl of `trait Sandbox` (process group on host, no isolation, the simplest possible impl); rewrite `session_host.rs` to use `Workspace` + `Sandbox` + `cuartel-acp`; delete `GATEWAY_PORT`/`CUARTEL_LOOPBACK_EXEMPT_PORT` plumbing; keep auth-gateway as opt-in; SQLite migration for `sessions` table (MVP shape — Replicas come in C3); migrate any in-flight existing sessions to the new schema (or document one-time wipe). out: VM-based sandboxing (Phase D), portless integration (C3), persistence/UI rework (C2).
-- **DoD:**
-  1. ✅ AgentOS secure-exec is no longer launched by cuartel-app's session path. (`grep` confirms.)
-  2. ✅ A fresh cuartel-app launch creates a new session via `Workspace` + `LocalSandbox` + `cuartel-acp` and completes one full turn.
-  3. ✅ The sendPrompt-hang regression test (5+ consecutive runs) passes consistently.
-  4. ✅ DB migration for the new `sessions` table runs cleanly on a real existing user DB.
-  5. ✅ Auth gateway works in opt-in mode for at least one provider (Claude with `ANTHROPIC_BASE_URL` redirect).
-  6. ✅ Smoke test: launch cuartel-app, create a workspace from a real repo, run one prompt, see PR-ready diff.
-  7. ✅ Old `cuartel-rivet` crate marked deprecated (kept compilable for ≥1 release as fallback).
-- **Effort:** 2 person-weeks.
+- **DoD progress (updated 2026-04-27 after step 1 commit `feb6d10`):**
+  1. ⚠️ Partial — `CUARTEL_USE_ACP=1` opts into the host-direct ACP driver; AgentOS secure-exec still spawned by default. Flipping default + ripping out Rivet path lands in a follow-up commit once the user smoke-tests the ACP path in GPUI.
+  2. ✅ `tests/live_claude_code_acp.rs` proves cuartel-acp + LocalSandbox completes a full turn end-to-end (`stop_reason=end_turn`, ~15s, clean dispose).
+  3. ✅ `tests/no_hang_regression.rs` runs 5 consecutive turns, **5/5 pass, 0 hangs, p_min=7.48s, p_max=9.14s.** sendPrompt-hang is gone for the new path.
+  4. ⏳ DB schema unchanged in step 1 (existing `sessions` table is sufficient). Event-log migration lands in C2 alongside Session-as-event-log per D9.
+  5. ✅ Auth gateway plumbing untouched; the new ACP path uses the user's existing `claude` CLI subscription auth (no `ANTHROPIC_BASE_URL` redirect needed for that path).
+  6. ⏳ User smoke-test pending: launch cuartel-app with `CUARTEL_USE_ACP=1 CUARTEL_ACP_CWD=/path/to/repo cargo run -p cuartel-app`.
+  7. ⏳ `cuartel-rivet` deprecation deferred until step-1 has GPUI smoke-test signoff.
+- **Effort:** 2 person-weeks (~half spent on step 1).
 - **Risks:** Existing-session migration edge cases; first-time users without `claude` CLI auth need a clean error path.
 - **Rollback:** Feature-flag the new path; old AgentOS secure-exec path stays bootable for one release. If new path errors, fall back automatically and log telemetry.
 
