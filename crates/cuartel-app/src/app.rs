@@ -3,11 +3,13 @@ use crate::onboarding_view::{OnboardingCompleted, OnboardingView};
 use crate::permission_prompt::{PermissionDecision, PermissionPrompt};
 use crate::ports_panel::{PortForwardAdd, PortForwardRemove, PortForwardToggle, PortsPanel};
 use crate::server_registry_host::ServerRegistryHost;
-use crate::session_host::{SessionHost, SessionHostConfig, SessionStateChange};
+use crate::session_host::{AgentMode, SessionHost, SessionHostConfig, SessionStateChange};
 use crate::settings_view::{SettingsDismissed, SettingsView};
 use crate::sidebar::{ServerSelected, SessionItem, SessionSelected, SettingsRequested, Sidebar};
 use crate::sidecar_host::SidecarStatus;
-use crate::tab_bar::{NewTabRequested, TabBar, TabCloseRequested, TabInfo, TabSelected};
+use crate::tab_bar::{
+    AgentModeSelected, NewTabRequested, TabBar, TabCloseRequested, TabInfo, TabSelected,
+};
 use crate::theme::Theme;
 use crate::timeline_view::{CheckpointDelete, CheckpointFork, CheckpointRestore, TimelineView};
 use crate::workspace::{PromptSubmitted, WorkspaceView};
@@ -71,6 +73,10 @@ pub struct CuartelApp {
     firewall: Arc<NetworkPolicy>,
     #[allow(dead_code)] // Read by 7e session routing.
     active_server_id: String,
+    /// Driver mode applied to the next session created via the "+" tab
+    /// button. Seeded from `CUARTEL_USE_ACP` / `CUARTEL_NATIVE_CLAUDE`
+    /// at startup; the tab-bar mode picker rebinds it on user click.
+    next_agent_mode: AgentMode,
 }
 
 impl CuartelApp {
@@ -96,7 +102,8 @@ impl CuartelApp {
         let sidebar_state = server_state.clone();
         let sidebar = cx.new(|cx| Sidebar::new(sidecar_status.clone(), sidebar_state, cx));
 
-        let tab_bar = cx.new(|cx| TabBar::new(cx));
+        let initial_mode = AgentMode::from_env();
+        let tab_bar = cx.new(|cx| TabBar::new(initial_mode, cx));
 
         let session_id = "session-1".to_string();
         let label = "Session 1".to_string();
@@ -142,6 +149,7 @@ impl CuartelApp {
             agent_type: initial_agent.rivet_name().to_string(),
             actor_key: format!("cuartel-{session_id}"),
             workspace_id: "workspace-default".to_string(),
+            agent_mode: Some(initial_mode),
         };
 
         let session_host = cx.new({
@@ -207,6 +215,7 @@ impl CuartelApp {
         cx.subscribe(&tab_bar, Self::on_new_tab_requested).detach();
         cx.subscribe(&tab_bar, Self::on_tab_close_requested)
             .detach();
+        cx.subscribe(&tab_bar, Self::on_agent_mode_selected).detach();
 
         let onboarding_view = if !onboarding_config.completed {
             let initial_default = onboarding_config.default_harness.clone();
@@ -241,6 +250,7 @@ impl CuartelApp {
             _server_registry_host: server_registry_host,
             firewall,
             active_server_id: cuartel_db::servers::LOCAL_SERVER_ID.to_string(),
+            next_agent_mode: initial_mode,
         }
     }
 
@@ -306,6 +316,7 @@ impl CuartelApp {
             agent_type: agent.rivet_name().to_string(),
             actor_key: format!("cuartel-{session_id}"),
             workspace_id: "workspace-default".to_string(),
+            agent_mode: Some(self.next_agent_mode),
         };
 
         let session_host = cx.new({
@@ -557,6 +568,19 @@ impl CuartelApp {
         self.close_session(&event.session_id.clone(), cx);
     }
 
+    fn on_agent_mode_selected(
+        &mut self,
+        _tab_bar: Entity<TabBar>,
+        event: &AgentModeSelected,
+        _cx: &mut Context<Self>,
+    ) {
+        log::info!(
+            "[app] next-session agent mode → {} (applies to next +tab)",
+            event.mode.short_label()
+        );
+        self.next_agent_mode = event.mode;
+    }
+
     fn on_permission_decision(
         &mut self,
         _prompt: Entity<PermissionPrompt>,
@@ -676,6 +700,7 @@ impl CuartelApp {
             agent_type: agent.rivet_name().to_string(),
             actor_key: format!("cuartel-{session_id}"),
             workspace_id: "workspace-default".to_string(),
+            agent_mode: Some(self.next_agent_mode),
         };
 
         let session_host = cx.new({

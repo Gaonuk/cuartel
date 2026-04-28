@@ -145,34 +145,47 @@ impl TerminalView {
 
     fn start_shell(&mut self, cx: &mut Context<Self>) {
         match PtySession::spawn_shell(DEFAULT_ROWS as u16, DEFAULT_COLS as u16) {
-            Ok(session) => {
-                let session = Arc::new(session);
-                self.pty = Some(session.clone());
-                self._poll_task = Some(cx.spawn(async move |this, cx| {
-                    loop {
-                        cx.background_executor()
-                            .timer(Duration::from_millis(16))
-                            .await;
-                        let chunk = session.drain_output();
-                        if this
-                            .update(cx, |view, cx| {
-                                if !chunk.is_empty() {
-                                    view.term.advance(&chunk);
-                                    cx.notify();
-                                }
-                            })
-                            .is_err()
-                        {
-                            break;
-                        }
-                    }
-                }));
-            }
+            Ok(session) => self.attach_pty(Arc::new(session), cx),
             Err(e) => {
                 log::error!("failed to spawn pty: {e}");
                 self.error = Some(format!("failed to spawn shell: {e}").into());
             }
         }
+    }
+
+    /// Attach an externally-spawned [`PtySession`] to this terminal.
+    ///
+    /// Used by cuartel-app's "native Claude Code UI" mode: session_host
+    /// spawns the bare `claude` CLI via `PtySession::spawn_command`,
+    /// then hands the live PTY here. After this call, terminal output
+    /// streams from the PTY directly (no SessionHostEvent::Bytes hop)
+    /// and keystrokes / [`Self::write_bytes`] forward to PTY stdin.
+    pub fn attach_pty(&mut self, session: Arc<PtySession>, cx: &mut Context<Self>) {
+        self.pty = Some(session.clone());
+        // Note: the existing grid contents stay until the new agent's
+        // output overlays them. A real `reset()` could go on the
+        // Terminal type later; not load-bearing for the native-Claude
+        // path because claude clears the screen on start anyway.
+        cx.notify();
+        self._poll_task = Some(cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(Duration::from_millis(16))
+                    .await;
+                let chunk = session.drain_output();
+                if this
+                    .update(cx, |view, cx| {
+                        if !chunk.is_empty() {
+                            view.term.advance(&chunk);
+                            cx.notify();
+                        }
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        }));
     }
 
     pub fn write_bytes(&self, bytes: &[u8]) {

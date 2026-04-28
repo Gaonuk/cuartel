@@ -294,21 +294,32 @@ fn build_sidecar_env(
 /// never want the app to refuse to start because the user is on a headless
 /// machine or the keychain plugin is locked.
 ///
-/// **Skipped entirely when `CUARTEL_USE_ACP=1`.** The new host-direct
-/// ACP path uses the user's existing `~/.claude/` subscription auth via
-/// the spawned `claude-code-acp` subprocess; it does not consult
-/// cuartel's keychain entry at all. Probing the keychain in that mode
-/// would surface the macOS prompt-on-every-launch problem (caused by
-/// dev-build code-signature instability) for no benefit.
+/// **Skipped entirely when either `CUARTEL_USE_ACP=1` or
+/// `CUARTEL_NATIVE_CLAUDE=1` is set.** Both non-Rivet paths use the
+/// user's existing `~/.claude/` subscription auth via the spawned
+/// `claude` / `claude-code-acp` subprocess; neither consults cuartel's
+/// keychain entry at all. Probing the keychain in those modes would
+/// surface the macOS prompt-on-every-launch problem (caused by dev-build
+/// code-signature instability) for no benefit — the user could deny it
+/// and the agent would still work, which is exactly what we observed.
 fn build_credential_store() -> Arc<dyn CredentialStore> {
-    let acp_enabled = std::env::var("CUARTEL_USE_ACP")
-        .ok()
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false);
-    if acp_enabled {
+    let env_truthy = |var: &str| {
+        std::env::var(var)
+            .ok()
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+    };
+    let acp_enabled = env_truthy("CUARTEL_USE_ACP");
+    let native_claude_enabled = env_truthy("CUARTEL_NATIVE_CLAUDE");
+    if acp_enabled || native_claude_enabled {
+        let toggle = if native_claude_enabled {
+            "CUARTEL_NATIVE_CLAUDE"
+        } else {
+            "CUARTEL_USE_ACP"
+        };
         log::info!(
-            "credential store: in-memory (CUARTEL_USE_ACP=1; skipping keychain probe to \
-             avoid the macOS prompt-on-every-launch — claude-code-acp uses ~/.claude/ auth)"
+            "credential store: in-memory ({toggle}=1; skipping keychain probe to \
+             avoid the macOS prompt-on-every-launch — agent uses ~/.claude/ auth)"
         );
         return Arc::new(MemoryCredentialStore::new());
     }
