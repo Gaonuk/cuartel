@@ -148,7 +148,12 @@ Promoted out of "open questions" once research consensus + recommendation lined 
 
 **D2. ACP server runs INSIDE the sandbox**, co-located with the workspace. Tool calls are loopback inside the VM. Host↔sandbox traffic is ACP messages only. Pinned by the fact that `claude-code-acp` runs all tools locally to its Node process — virtualizing FS via ACP's `fs/*` RPCs would require forking upstream. KB §3 D2.
 
-**D3. Sandbox = real Linux VM, NOT V8 isolate.** Apple VZ locally, Firecracker on Hetzner. AgentOS secure-exec is removed from the agent runtime. KB §3 D3.
+**D3. Sandbox is pluggable with two tiers.** *(Updated 2026-04-27 after A1 spike + scope discussion.)*
+- **MVP default — `LocalSandbox`:** claude-code-acp as a plain host subprocess. **No isolation.** Same as Zed / Polyscope / Paseo / Cursor — every comparable product ships interactive coding agents this way. The user-in-the-loop permission UI is the safety net for interactive sessions.
+- **Secure mode — `AppleVzSandbox` / `HetznerSandbox`:** real Linux VM. Required for **autonomous / scheduled / unattended / remote** work where the user isn't watching each tool call. Ships in Phase D as part of the remote-runtime + scheduled-Replicas surface.
+- **What's removed regardless:** AgentOS secure-exec (the V8 isolate that caused the sendPrompt hang). It was never the right primitive for executing third-party Node CLIs.
+
+The original v2 framing "real VM is the load-bearing MVP step" was over-rotated toward the security story. Spike A1 confirmed the V8-vs-OS hypothesis with a single host-side run; the Rust port (B1) + cutover (B3) are what's load-bearing. VM sandboxing earns its place when we ship autonomous/remote features in Phase D, not at MVP.
 
 **D4. Workspace is a first-class type above Sessions** with N worktrees, access policy, and `RuntimeLocation`. Lifted from Zed's `Project`/`WorktreeStore` model (`crates/project/src/project.rs:213`). KB §3 D4.
 
@@ -451,7 +456,9 @@ Each step has: **Goal** (one sentence), **Scope** (in/out), **DoD** (acceptance 
 - **Risks:** The hang reproduces on host (would mean V8 is not the cause; would force a different architectural pivot — likely fork claude-code-acp).
 - **Rollback:** Throwaway code; if hypothesis fails, the v2 plan needs reconsideration before Phase B.
 
-### Phase B — Replace the runtime (Weeks 2–7)
+### Phase B — Replace the runtime (Weeks 2–4)
+
+> **Pivoted 2026-04-27 (after A1 spike).** Original Phase B included `AppleVzSandbox` (B2) as the load-bearing step at ~3 person-weeks. After confirming the V8-vs-OS hypothesis and discussing scope, we ship MVP with `LocalSandbox` only — claude-code-acp as a plain host subprocess, like Zed/Polyscope/Paseo all do today. `AppleVzSandbox` moves to Phase D as the "secure mode" for autonomous/scheduled/remote work where the user isn't watching. **Saves ~3 person-weeks; gets to dogfood faster.**
 
 #### Step B1: `cuartel-acp` Rust crate
 - **Goal:** Production-quality ACP client in Rust; the foundation of every later step.
@@ -469,38 +476,22 @@ Each step has: **Goal** (one sentence), **Scope** (in/out), **DoD** (acceptance 
 - **Risks:** ACP's Rust client may have rough edges; tool-name variants discovered post-shipping.
 - **Rollback:** `cuartel-acp` is a library; partial impl still useful for spike iterations.
 
-#### Step B2: `AppleVzSandbox` (load-bearing)
-- **Goal:** Local Linux VM via Apple Virtualization.framework that boots claude-code-acp and exposes ACP transport over vsock. **This is the step that retires AgentOS secure-exec.**
-- **Scope:** in: depend on `shuru-vm` + `shuru-darwin`; build minimal Linux VM image with `claude-code-acp` + `portless` + `microsoft/playwright-mcp` + Chromium + minimal observability stack baked in; vsock-based stdio transport for ACP; `Sandbox::provision/spawn_agent/forward_port/snapshot/dispose` impls; lazy provision (defer VM allocation until first `spawn_agent` call). out: HetznerSandbox, full computer-use Tier 2 (Xvfb+VNC stays optional in image).
-- **DoD:**
-  1. ✅ VM cold-start time ≤ 5s from `provision()` to `spawn_agent` ready.
-  2. ✅ Lazy provisioning verified: `provision()` without `spawn_agent` allocates no VM.
-  3. ✅ Identical-results test: same prompt → `LocalSandbox` (B1) and `AppleVzSandbox` (B2) produce structurally-equivalent tool-call sequences. (Modulo PIDs and timestamps.)
-  4. ✅ portless inside VM serves a Vite dev server at `https://web.<branch>.<workspace>.localhost`. Reachable from host browser.
-  5. ✅ Snapshot + restore round-trips an active session within 10s.
-  6. ✅ Sandbox dispose leaves no orphan processes or disk artifacts.
-  7. ✅ Image build pipeline: a Makefile/Just target produces a `.dmg`-shippable image. Update cadence documented.
-  8. ✅ Run 100 sandbox lifecycles in CI (provision → spawn_agent → one turn → dispose) — no hangs, no leaked resources.
-- **Effort:** 3 person-weeks (substantial; image build + objc2 wiring via shuru + portless integration).
-- **Risks:** Apple VZ + Linux GPU-passthrough quirks; shuru API gaps (may need upstream PRs); image-size bloat from Chromium (~200MB).
-- **Rollback:** `LocalSandbox` (process-group on host) stays as the dev/CI fallback. AgentOS secure-exec stays bootable until B3 cutover succeeds in production.
-
-#### Step B3: Cut over `session_host.rs` to `Workspace` + `Sandbox` + `cuartel-acp`
-- **Goal:** The cuartel-app's session orchestrator no longer talks to AgentOS secure-exec. Every new session uses the new stack.
-- **Scope:** in: rewrite `session_host.rs`; delete `GATEWAY_PORT`/`CUARTEL_LOOPBACK_EXEMPT_PORT` plumbing; keep auth-gateway as opt-in; SQLite migration for `sessions` table (MVP shape — Replicas come in C2/C3); migrate any in-flight existing sessions to the new schema (or document one-time wipe). out: persistence/UI rework (in C2), command-center (in E1), Replicas-as-data (in E2).
+#### Step B2: `LocalSandbox` impl + cutover
+- **Goal:** Replace AgentOS secure-exec with `LocalSandbox` (claude-code-acp as a plain host subprocess). Cuartel runs the new stack; sendPrompt hang gone.
+- **Scope:** in: `LocalSandbox` impl of `trait Sandbox` (process group on host, no isolation, the simplest possible impl); rewrite `session_host.rs` to use `Workspace` + `Sandbox` + `cuartel-acp`; delete `GATEWAY_PORT`/`CUARTEL_LOOPBACK_EXEMPT_PORT` plumbing; keep auth-gateway as opt-in; SQLite migration for `sessions` table (MVP shape — Replicas come in C3); migrate any in-flight existing sessions to the new schema (or document one-time wipe). out: VM-based sandboxing (Phase D), portless integration (C3), persistence/UI rework (C2).
 - **DoD:**
   1. ✅ AgentOS secure-exec is no longer launched by cuartel-app's session path. (`grep` confirms.)
-  2. ✅ A fresh cuartel-app launch creates a new session via `Workspace` + `AppleVzSandbox` + `cuartel-acp`.
-  3. ✅ The sendPrompt-hang regression test (50 consecutive runs) passes.
+  2. ✅ A fresh cuartel-app launch creates a new session via `Workspace` + `LocalSandbox` + `cuartel-acp` and completes one full turn.
+  3. ✅ The sendPrompt-hang regression test (5+ consecutive runs) passes consistently.
   4. ✅ DB migration for the new `sessions` table runs cleanly on a real existing user DB.
   5. ✅ Auth gateway works in opt-in mode for at least one provider (Claude with `ANTHROPIC_BASE_URL` redirect).
   6. ✅ Smoke test: launch cuartel-app, create a workspace from a real repo, run one prompt, see PR-ready diff.
-  7. ✅ Old `cuartel-rivet` crate marked deprecated (kept compilable for ≥1 release for fallback).
+  7. ✅ Old `cuartel-rivet` crate marked deprecated (kept compilable for ≥1 release as fallback).
 - **Effort:** 2 person-weeks.
-- **Risks:** Existing-session migration edge cases; users on macOS versions without VZ entitlement support.
+- **Risks:** Existing-session migration edge cases; first-time users without `claude` CLI auth need a clean error path.
 - **Rollback:** Feature-flag the new path; old AgentOS secure-exec path stays bootable for one release. If new path errors, fall back automatically and log telemetry.
 
-> **End of Phase B: cuartel runs on real VMs. No more V8 nesting hang. Architecture is sound but UX is still rudimentary.**
+> **End of Phase B: cuartel runs claude-code-acp natively, no V8 nesting, no hang. Architecture is sound; UX still rudimentary. Same isolation level as Zed/Polyscope/Paseo today (i.e. host-direct with permission UI as the safety net).**
 
 ### Phase C — MVP (Weeks 8–15) — DOGFOOD LINE
 
@@ -576,7 +567,26 @@ Each step has: **Goal** (one sentence), **Scope** (in/out), **DoD** (acceptance 
 
 > **🎯 END OF PHASE C: cuartel is self-hosting. The MVP is shipped.** From this point on, every feature is built with cuartel.
 
-### Phase D — Remote runtime + workspace mobility (Weeks 16–21)
+### Phase D — Remote runtime + secure-mode VM sandbox + workspace mobility (Weeks 13–21)
+
+> **Why VM sandboxing lives here, not in MVP.** Interactive sessions where a user is at the keyboard approving each tool call don't need VM isolation — the user is the sandbox. **VM sandboxing earns its place when the user isn't watching:** scheduled Replicas, GitHub-webhook-triggered runs, "ship it" autonomous mode, and remote sandboxes on Hetzner where untrusted code runs without local supervision. So `AppleVzSandbox` ships here, alongside `HetznerSandbox`, gated behind an opt-in "secure mode" toggle that becomes the default for autonomous/scheduled work.
+
+#### Step D0: `AppleVzSandbox` as opt-in secure mode (was B2 in original v2)
+- **Goal:** Local Linux VM via Apple Virtualization.framework that boots claude-code-acp and exposes ACP transport over vsock. Available as `Workspace.sandbox = "vm"` opt-in, automatically chosen when a session is autonomous/scheduled/unattended.
+- **Scope:** in: depend on `shuru-vm` + `shuru-darwin`; build minimal Linux VM image with `claude-code-acp` + `portless` + `microsoft/playwright-mcp` + Chromium baked in; vsock-based stdio transport for ACP; `Sandbox::provision/spawn_agent/forward_port/snapshot/dispose` impls; lazy provision (defer VM allocation until first `spawn_agent` call); per-Workspace + per-Replica config flag to opt into VM mode. out: HetznerSandbox (D1, builds on the same image).
+- **DoD:**
+  1. ✅ VM cold-start time ≤ 5s from `provision()` to `spawn_agent` ready.
+  2. ✅ Lazy provisioning verified: `provision()` without `spawn_agent` allocates no VM.
+  3. ✅ Identical-results test: same prompt → `LocalSandbox` and `AppleVzSandbox` produce structurally-equivalent tool-call sequences.
+  4. ✅ portless inside VM serves a Vite dev server at `https://web.<branch>.<workspace>.localhost`. Reachable from host browser.
+  5. ✅ Snapshot + restore round-trips an active session within 10s.
+  6. ✅ Sandbox dispose leaves no orphan processes or disk artifacts.
+  7. ✅ Image build pipeline produces a `.dmg`-shippable image. Update cadence documented.
+  8. ✅ Run 100 sandbox lifecycles in CI (provision → spawn_agent → one turn → dispose) — no hangs, no leaked resources.
+  9. ✅ Workspace can opt in via `cuartel.json` `workspace.sandbox: "vm"`; per-Replica override works; autonomous Replicas (cron / webhook / "ship it" mode) auto-select VM.
+- **Effort:** 3 person-weeks.
+- **Risks:** Apple VZ + Linux GPU-passthrough quirks; shuru API gaps (may need upstream PRs); image-size bloat from Chromium (~200MB).
+- **Rollback:** `LocalSandbox` stays default. VM mode is opt-in; users who don't want it never see it. If shuru blocks us, fork (Apache-2.0).
 
 #### Step D1: `HetznerSandbox`
 - **Goal:** Sessions can run on a Hetzner box co-located with the workspace files. ACP wire travels host↔Hetzner over Tailscale; tool calls are loopback inside the remote VM.
@@ -702,8 +712,8 @@ Features become independent shippable units once Phase E foundations are in plac
 
 | Capability | Phase | Why required |
 |---|---|---|
-| Real Linux VM sandbox locally | B2 | The whole architecture rests on this |
-| `claude-code-acp` baked in image, ACP transport works | A1 + B1 + B2 | Single agent provider must work end-to-end |
+| `LocalSandbox` (claude-code-acp as host subprocess, no isolation) | B2 | Same isolation level as Zed/Polyscope/Paseo today; user-in-the-loop perms are the safety net |
+| `claude-code-acp` ACP transport works end-to-end | A1 + B1 + B2 | Single agent provider must work cleanly |
 | Session creation, persistence, restore across cuartel-app restarts | C2 | Without this, work is lost on every restart |
 | Parallel sessions UI (sidebar + retained pool + notifications) | C2 | Multi-agent work is the product |
 | `cuartel.json` workspace config + Tasks + portless integration | C3 | Real dev environments need real dev infrastructure |
@@ -712,17 +722,21 @@ Features become independent shippable units once Phase E foundations are in plac
 | `--output-schema` for structured agent responses | C4 | Foundation for implement+verify shell loops |
 | Minimal MCP server for sub-agent control (`replica.spawn`/`send`/`wait`) | C4 | Substrate for any orchestration |
 | daemon + multi-client split | C1 | Without this, every Phase D/E/F feature retrofits painfully |
-| sendPrompt hang regression test passing 50/50 runs | A1 → ongoing | The bug that triggered the refactor |
+| sendPrompt hang regression test passing 5+ consecutive runs | A1 → ongoing | The bug that triggered the refactor |
+| User permission UI for tool calls (PreToolUse-style approval) | C2 | The safety net for host-direct MVP — without VM isolation, the user is the boundary |
+
+**Why VM isolation is NOT in the MVP (deferred to Phase D step D0):** every comparable product (Zed, Polyscope, Paseo, Cursor) ships interactive coding agents host-direct with permission UI as the safety net. VM isolation is genuinely valuable for **autonomous / scheduled / unattended / remote** work where the user isn't present to approve each tool call — and that's exactly when it ships (Phase D, where remote runtime + scheduled Replicas + "ship it" autonomous mode also land). For MVP interactive use, host-direct + user-approved tool calls is the right tier; sandbox-as-default would be over-engineering.
 
 ### What MVP does NOT require (deferred to Phase D/E/F)
 
+- **VM-based sandbox isolation (`AppleVzSandbox`)** — Phase D step D0; opt-in for users who want it, automatic for autonomous Replicas
 - Remote runtime (Hetzner) — Phase D
 - Workspace move local↔remote — Phase D
 - Background-session lifecycle on sleep — Phase D
 - Birds-eye command-center view — Phase E
 - Full Replica data model with triggers (cron, GitHub webhook) — Phase E
 - Blueprint visual editor — Phase E
-- Computer use (Tier 0/1/2) — Phase E
+- Computer use (Tier 0/1/2) — Phase E (Tier 0 DOM-picker works on host; Tier 1 Playwright works on host; Tier 2 full desktop VNC requires VM)
 - Voice — Phase E
 - Multiplayer — Phase F
 - LAN mode mDNS — Phase F
@@ -736,8 +750,8 @@ Features become independent shippable units once Phase E foundations are in plac
 | Sessions per engineer per day | ≥ 5 |
 | PRs to cuartel repo where ≥60% of diff was cuartel-driven | ≥ 1 in the dogfood week |
 | Falls-back-to-Polyscope/Paseo/Cursor/Claude-app for capability gaps | 0 (intentional choice OK; capability gap NOT) |
-| sendPrompt hang regression test pass rate | 50/50 |
-| Sandbox cold-start time p95 | ≤ 5s (Apple VZ local) |
+| sendPrompt hang regression test pass rate | 5+ consecutive runs, zero hangs |
+| Session-spawn time p95 (`LocalSandbox`) | ≤ 1s |
 | One-prompt-to-first-token p50 | ≤ 3s (claude-code-acp ready) |
 | App-restart-to-session-list-visible | ≤ 2s |
 | Cuartel-daemon memory under 6 parallel sessions | ≤ 1 GB |
@@ -825,18 +839,26 @@ After the MVP week, friction points triage into Phase D/E backlog. Anything that
 
 ## Migration plan (compressed view of the above phases)
 
-The phases above are the actual migration plan. This compressed view is for quick reference:
+The phases above are the actual migration plan. This compressed view is for quick reference (updated 2026-04-27 after the host-direct-MVP pivot):
 
 ```
-A1   →  B1 → B2 → B3   →   C1 → C2 → C3 → C4 → C5   →   D1 → D2 → D3   →   E1 → E2 → E3 → E4   →   F (ongoing)
-[1w]    [1.5+3+2 = 6.5w]    [2+2+2+1.5+1 = 8.5w]       [3+2+1 = 6w]        [3+3+3+3 = 12w]
-                                                  ↑
-                                           DOGFOOD LINE (MVP)
+A1   →   B1 → B2   →   C1 → C2 → C3 → C4 → C5   →   D0 → D1 → D2 → D3   →   E1 → E2 → E3 → E4   →   F (ongoing)
+[1w]     [1.5+2 = 3.5w]   [2+2+2+1.5+1 = 8.5w]       [3+3+2+1 = 9w]            [3+3+3+3 = 12w]
+                                              ↑
+                                      DOGFOOD LINE (MVP)
 ```
 
-Total to MVP (Phase A + B + C): **~16 person-weeks** of focused engineering for one engineer. With two engineers in parallel where steps allow, can compress to ~10-12 weeks calendar.
+Where:
+- **A1** — confirm V8-vs-OS hypothesis (done; one run, zero hang).
+- **B1+B2** — cuartel-acp Rust crate + LocalSandbox cutover. **No VM in MVP.**
+- **C1–C5** — daemon split, persistence, cuartel.json+Replicas+portless, CLI+output-schemas+MCP-server, dogfood checkpoint. **End of C5 = MVP.**
+- **D0** — `AppleVzSandbox` as opt-in secure mode. (Was originally B2; deferred until sandbox isolation earns its place via autonomous-work features in D and E.)
+- **D1–D3** — HetznerSandbox + workspace move + background sessions.
+- **E1–E4** — visual command center + Replicas v1 + computer use + voice + scheduler.
 
-Total to feature-complete v2 (through Phase E): **~34 person-weeks** for one engineer; ~22 weeks calendar with two engineers; less with three (some Phase E work parallelizes well).
+**Total to MVP (Phase A + B + C): ~13 person-weeks** of focused engineering for one engineer (down from ~16 in the original v2 — saved ~3 weeks by deferring `AppleVzSandbox`). With two engineers in parallel where steps allow, ~8-10 weeks calendar.
+
+**Total to feature-complete v2 (through Phase E): ~34 person-weeks** for one engineer; ~22 weeks calendar with two engineers. Same as before — `AppleVzSandbox` work isn't deleted, just resequenced.
 
 ---
 

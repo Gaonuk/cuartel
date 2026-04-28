@@ -1,0 +1,18 @@
+{
+  "name": "cuartel-spike-a1-localsandbox",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "description": "Spike A1: prove that claude-code-acp completes prompts reliably outside a V8 sandbox.",
+  "scripts": {
+    "once": "node --experimental-strip-types src/run-once.ts",
+    "fifty": "node --experimental-strip-types src/run-50x.ts",
+    "load-session": "node --experimental-strip-types src/test-load-session.ts"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "dependencies": {
+    "@agentclientprotocol/claude-agent-acp": "^0.31.1"
+  }
+}
