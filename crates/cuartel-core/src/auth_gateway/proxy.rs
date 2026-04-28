@@ -396,6 +396,7 @@ mod tests {
     use hyper::Method;
 
     use super::super::rules::{AuthGatewayConfig, AuthRule, MissPolicy};
+    use super::super::firewall::FirewallPolicy;
 
     fn empty_body() -> Empty<Bytes> {
         Empty::<Bytes>::new()
