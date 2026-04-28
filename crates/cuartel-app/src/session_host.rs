@@ -32,10 +32,42 @@ use gpui::*;
 use parking_lot::Mutex;
 use serde_json::json;
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::runtime::Handle;
 use tokio::sync::mpsc::{self, error::TryRecvError, UnboundedReceiver, UnboundedSender};
+
+/// Feature flag for the host-direct ACP path (Phase B2 of v2 doc).
+///
+/// When `CUARTEL_USE_ACP=1` is set, [`SessionHost::new`] spawns
+/// [`run_driver_acp`] instead of the Rivet-backed [`run_driver`]. The
+/// ACP path runs `claude-code-acp` as a plain host subprocess via
+/// `cuartel-acp::LocalSandbox` — no V8, no Rivet sidecar, no AgentOS
+/// secure-exec. Same isolation tier as Zed/Polyscope/Paseo today
+/// (host-direct + permission UI as the safety net).
+///
+/// The Rivet path stays the default until the new path is shaken out;
+/// then we swap defaults and remove the Rivet path entirely.
+const ACP_TOGGLE_ENV: &str = "CUARTEL_USE_ACP";
+
+fn acp_path_enabled() -> bool {
+    std::env::var(ACP_TOGGLE_ENV)
+        .ok()
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
+/// Working directory for ACP sessions when the toggle is on. Override
+/// with `CUARTEL_ACP_CWD=/path/to/repo`. Falls back to the cuartel-app
+/// process's current dir. The full Workspace abstraction (with N
+/// worktrees + access policy) lands in Phase C3.
+fn acp_session_cwd() -> PathBuf {
+    if let Ok(p) = std::env::var("CUARTEL_ACP_CWD") {
+        return PathBuf::from(p);
+    }
+    std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"))
+}
 
 #[derive(Clone, Debug)]
 pub struct SessionStateChange {
@@ -115,14 +147,21 @@ impl SessionHost {
 
         let driver_config = config.clone();
         let env_clone = env.clone();
-        runtime.spawn(run_driver(
-            driver_config,
-            client_slot,
-            sidecar_status,
-            event_tx,
-            cmd_rx,
-            env_clone,
-        ));
+        if acp_path_enabled() {
+            log::info!(
+                "[session_host] {ACP_TOGGLE_ENV}=1 — spawning host-direct ACP driver"
+            );
+            runtime.spawn(run_driver_acp(driver_config, event_tx, cmd_rx));
+        } else {
+            runtime.spawn(run_driver(
+                driver_config,
+                client_slot,
+                sidecar_status,
+                event_tx,
+                cmd_rx,
+                env_clone,
+            ));
+        }
 
         let poll_task = cx.spawn(async move |this, cx| {
             let mut event_rx = event_rx;
@@ -518,4 +557,146 @@ fn build_pending_permission(p: &PermissionRequestPayload) -> Option<PendingPermi
         summary.tool_name,
         summary.input,
     ))
+}
+
+// ============================================================================
+// Host-direct ACP driver (Phase B2 of v2 doc)
+//
+// Sibling to `run_driver` above. Activated by `CUARTEL_USE_ACP=1`.
+// Spawns claude-code-acp via cuartel-acp::LocalSandbox, runs prompts
+// through it, forwards events to the same SessionHostEvent channel
+// the existing dispatcher consumes — so the rest of the UI is
+// unchanged. The Rivet path stays the default until this is shaken
+// out; eventually we delete the Rivet path entirely.
+// ============================================================================
+
+async fn run_driver_acp(
+    config: SessionHostConfig,
+    event_tx: UnboundedSender<SessionHostEvent>,
+    mut cmd_rx: UnboundedReceiver<SessionHostCommand>,
+) {
+    let cwd = acp_session_cwd();
+    let _ = event_tx.send(SessionHostEvent::Status(format!(
+        "ACP path: spawning claude-code-acp in {}",
+        cwd.display()
+    )));
+
+    let client = match cuartel_acp::spawn_local_with_default_handler(cwd.clone()).await {
+        Ok(c) => c,
+        Err(e) => {
+            let _ = event_tx.send(SessionHostEvent::Error(format!(
+                "claude-code-acp spawn failed: {e}"
+            )));
+            return;
+        }
+    };
+    let _ = event_tx.send(SessionHostEvent::Status(format!(
+        "ACP server up; loadSession={}",
+        client.capabilities().load_session,
+    )));
+
+    let session = match client.new_session(cwd).await {
+        Ok(s) => s,
+        Err(e) => {
+            let _ = event_tx.send(SessionHostEvent::Error(format!(
+                "new_session failed: {e}"
+            )));
+            return;
+        }
+    };
+    let _ = event_tx.send(SessionHostEvent::StateEvent(CoreSessionEvent::BootCompleted));
+    let _ = event_tx.send(SessionHostEvent::Status(format!(
+        "ACP session ready ({})",
+        session.id
+    )));
+
+    loop {
+        match cmd_rx.recv().await {
+            Some(SessionHostCommand::SendPrompt(text)) => {
+                let _ = event_tx.send(SessionHostEvent::StateEvent(CoreSessionEvent::PromptSent));
+                let mut events = match client.prompt(&session, text).await {
+                    Ok(rx) => rx,
+                    Err(e) => {
+                        let _ = event_tx.send(SessionHostEvent::Error(format!(
+                            "prompt request failed: {e}"
+                        )));
+                        continue;
+                    }
+                };
+                while let Some(ev) = events.recv().await {
+                    if !translate_acp_event(ev, &event_tx) {
+                        break;
+                    }
+                }
+                let _ = event_tx
+                    .send(SessionHostEvent::StateEvent(CoreSessionEvent::PromptCompleted));
+            }
+            Some(SessionHostCommand::Decision { .. }) => {
+                // The MVP NoOpClientHandler auto-approves all permission
+                // requests inside the ACP server, so user decisions
+                // never reach this driver. Real workspace-policy
+                // mediated handler lands in Phase C2; at that point
+                // these decisions get forwarded back to the handler
+                // via a oneshot/channel. For now, ignore.
+                log::debug!("[session_host_acp] decision received but no pending request");
+            }
+            Some(SessionHostCommand::Shutdown) => {
+                let _ = event_tx.send(SessionHostEvent::Closed("shutdown requested".into()));
+                break;
+            }
+            None => {
+                // Command channel closed — UI side dropped. Bail.
+                break;
+            }
+        }
+    }
+
+    // Drop client; its Drop impl signals the ACP bg task to exit and
+    // claude-code-acp gets reaped via tokio::process::Command::kill_on_drop.
+    drop(client);
+    let _ = config; // suppress unused warning; kept for symmetry with run_driver
+}
+
+/// Translate one cuartel-acp SessionEvent into one or more
+/// SessionHostEvents for the existing GPUI dispatcher. Returns `false`
+/// when the stream should stop (TurnComplete or Error).
+fn translate_acp_event(
+    ev: cuartel_acp::SessionEvent,
+    event_tx: &UnboundedSender<SessionHostEvent>,
+) -> bool {
+    use cuartel_acp::SessionEvent as SE;
+    match ev {
+        SE::UserPrompt { .. } => true,
+        SE::AgentMessageChunk { text } | SE::AgentThoughtChunk { text } => {
+            let _ = event_tx.send(SessionHostEvent::Text(text));
+            true
+        }
+        SE::ToolCall { kind, raw_name, .. } => {
+            let _ = event_tx.send(SessionHostEvent::Text(format!(
+                "\n[tool: {} ({})]\n",
+                raw_name,
+                kind.as_str()
+            )));
+            true
+        }
+        SE::ToolCallResult { is_error, .. } => {
+            if is_error {
+                let _ = event_tx.send(SessionHostEvent::Text("[tool: error]\n".into()));
+            }
+            true
+        }
+        SE::PermissionRequested { .. } | SE::PermissionResolved { .. } => true,
+        SE::TurnComplete { stop_reason } => {
+            let _ = event_tx.send(SessionHostEvent::Text(format!(
+                "\n[turn complete: {stop_reason}]\n"
+            )));
+            false
+        }
+        SE::Error { message } => {
+            let _ = event_tx.send(SessionHostEvent::Error(message));
+            false
+        }
+        // SessionEvent is #[non_exhaustive] — keep going on unknown variants.
+        _ => true,
+    }
 }

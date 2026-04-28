@@ -37,6 +37,7 @@ pub mod client;
 pub mod client_handler;
 pub mod error;
 pub mod normalize;
+pub mod sandbox;
 pub mod session;
 pub mod transport;
 
@@ -44,6 +45,7 @@ pub use client::{AcpClient, AcpClientOptions};
 pub use client_handler::{ClientHandler, NoOpClientHandler, PermissionDecision, PermissionRequest};
 pub use error::{AcpError, Result};
 pub use normalize::{normalize_tool_name, ToolKind};
+pub use sandbox::{spawn_local_with_default_handler, LocalSandbox, Sandbox};
 pub use session::{SessionEvent, SessionHandle, SessionId};
 
 // Re-export the upstream schema for callers that need raw types.
