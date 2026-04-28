@@ -12,6 +12,7 @@ use crate::tab_bar::{
 };
 use crate::theme::Theme;
 use crate::timeline_view::{CheckpointDelete, CheckpointFork, CheckpointRestore, TimelineView};
+use crate::worktree;
 use crate::workspace::{PromptSubmitted, WorkspaceView};
 use chrono::Utc;
 use cuartel_core::agent::{AgentType, HarnessRegistry};
@@ -46,6 +47,12 @@ struct SessionSlot {
     permission_prompt: Entity<PermissionPrompt>,
     session_host: Entity<SessionHost>,
     state: SessionState,
+    /// Per-session worktree path. `None` when no workspace is set or
+    /// the workspace is not a git repo. Surfaced in the UI later
+    /// (sidebar tooltip / status bar) so the user can copy-paste it
+    /// into a terminal.
+    #[allow(dead_code)]
+    worktree_path: Option<PathBuf>,
     _host_sub: Subscription,
     _perm_sub: Subscription,
 }
@@ -105,32 +112,25 @@ impl CuartelApp {
         let initial_mode = AgentMode::from_env();
         let tab_bar = cx.new(|cx| TabBar::new(initial_mode, cx));
 
-        let session_id = "session-1".to_string();
-        let label = "Session 1".to_string();
-        let initial_agent = onboarding_config
-            .default_harness
-            .clone()
-            .unwrap_or(FALLBACK_AGENT);
-
-        let terminal = cx.new(|cx| TerminalView::new_headless(cx));
-        let permission_prompt = cx.new(|cx| PermissionPrompt::new(cx));
-        let diff_view = cx.new(|cx| DiffView::new(fixture_diffs(), cx));
-        let timeline_view = cx.new({
-            let sid = session_id.clone();
-            move |cx| TimelineView::new(sid, cx)
-        });
-        let ports_panel = cx.new({
-            let sid = session_id.clone();
-            move |cx| PortsPanel::new(sid, cx)
-        });
+        // WorkspaceView's constructor wants real entities for the four
+        // panes. While there are zero sessions we never actually render
+        // the workspace (CuartelApp::render branches on sessions.is_empty()
+        // and shows the empty-state CTA instead), so these placeholders
+        // are throwaway — they get replaced via swap_views() the moment
+        // the user creates the first session.
+        let placeholder_terminal = cx.new(|cx| TerminalView::new_headless(cx));
+        let placeholder_permission = cx.new(|cx| PermissionPrompt::new(cx));
+        let placeholder_diff = cx.new(|cx| DiffView::new(vec![], cx));
+        let placeholder_timeline = cx.new(|cx| TimelineView::new("placeholder".into(), cx));
+        let placeholder_ports = cx.new(|cx| PortsPanel::new("placeholder".into(), cx));
 
         let workspace = cx.new({
             let tab_bar = tab_bar.clone();
-            let permission_prompt = permission_prompt.clone();
-            let terminal = terminal.clone();
-            let diff_view = diff_view.clone();
-            let timeline_view = timeline_view.clone();
-            let ports_panel = ports_panel.clone();
+            let permission_prompt = placeholder_permission.clone();
+            let terminal = placeholder_terminal.clone();
+            let diff_view = placeholder_diff.clone();
+            let timeline_view = placeholder_timeline.clone();
+            let ports_panel = placeholder_ports.clone();
             |cx| {
                 WorkspaceView::new(
                     tab_bar,
@@ -142,58 +142,6 @@ impl CuartelApp {
                     cx,
                 )
             }
-        });
-
-        let config = SessionHostConfig {
-            session_id: session_id.clone(),
-            agent_type: initial_agent.rivet_name().to_string(),
-            actor_key: format!("cuartel-{session_id}"),
-            workspace_id: "workspace-default".to_string(),
-            agent_mode: Some(initial_mode),
-        };
-
-        let session_host = cx.new({
-            let runtime = runtime_handle.clone();
-            let client = rivet_client.clone();
-            let status = sidecar_status.clone();
-            let terminal = terminal.clone();
-            let perm = permission_prompt.clone();
-            let env = sidecar_env.clone();
-            move |cx| SessionHost::new(config, runtime, client, status, terminal, perm, env, cx)
-        });
-
-        let host_sub = cx.subscribe(&session_host, Self::on_session_state_change);
-        let perm_sub = cx.subscribe(&permission_prompt, Self::on_permission_decision);
-
-        let slot = SessionSlot {
-            id: session_id.clone(),
-            label: label.clone(),
-            agent: initial_agent.clone(),
-            terminal,
-            diff_view,
-            timeline_view,
-            ports_panel,
-            permission_prompt,
-            session_host,
-            state: SessionState::Created,
-            _host_sub: host_sub,
-            _perm_sub: perm_sub,
-        };
-
-        let tab_info = TabInfo {
-            session_id: session_id.clone(),
-            label: SharedString::from(label.clone()),
-            agent: initial_agent.clone(),
-            state: SessionState::Created,
-        };
-        tab_bar.update(cx, |tb, cx| {
-            tb.set_tabs(vec![tab_info], cx);
-            tb.set_active(&session_id, cx);
-        });
-
-        let sidebar_item = make_session_item(&slot);
-        sidebar.update(cx, |sb, cx| {
-            sb.set_sessions(vec![sidebar_item], cx);
         });
 
         cx.subscribe(&sidebar, Self::on_session_selected).detach();
@@ -228,13 +176,21 @@ impl CuartelApp {
             None
         };
 
+        // Workspace path stop-gap until proper Workspace selection lands
+        // (Phase C3). Honors CUARTEL_ACP_CWD if set, otherwise the
+        // process cwd. Used as the parent dir for `git worktree add`.
+        let workspace_path = std::env::var("CUARTEL_ACP_CWD")
+            .ok()
+            .map(PathBuf::from)
+            .or_else(|| std::env::current_dir().ok());
+
         Self {
             sidebar,
             workspace,
             tab_bar,
-            sessions: vec![slot],
+            sessions: vec![],
             active_session_idx: 0,
-            next_session_num: 2,
+            next_session_num: 1,
             sidecar_status,
             rivet_client,
             runtime_handle,
@@ -245,7 +201,7 @@ impl CuartelApp {
             credentials,
             onboarding_config,
             data_dir,
-            workspace_path: None,
+            workspace_path,
             server_registry,
             _server_registry_host: server_registry_host,
             firewall,
@@ -254,8 +210,8 @@ impl CuartelApp {
         }
     }
 
-    fn active_slot(&self) -> &SessionSlot {
-        &self.sessions[self.active_session_idx]
+    fn active_slot(&self) -> Option<&SessionSlot> {
+        self.sessions.get(self.active_session_idx)
     }
 
     fn default_agent(&self) -> AgentType {
@@ -270,9 +226,13 @@ impl CuartelApp {
     }
 
     fn switch_to(&mut self, idx: usize, cx: &mut Context<Self>) {
-        if idx >= self.sessions.len() || idx == self.active_session_idx {
+        if idx >= self.sessions.len() {
             return;
         }
+        // Don't early-return on no-op switches when sessions is freshly
+        // populated: after the first create_session, idx==0 and the
+        // previous active idx was also 0 (empty-state default), but the
+        // workspace still needs swap_views to bind the real entities.
         self.active_session_idx = idx;
         let slot = &self.sessions[idx];
         self.tab_bar.update(cx, |tb, cx| {
@@ -299,6 +259,8 @@ impl CuartelApp {
         let label = format!("Session {num}");
         let agent = self.default_agent();
 
+        let worktree_path = worktree::create_for(&self.workspace_path, &session_id);
+
         let terminal = cx.new(|cx| TerminalView::new_headless(cx));
         let permission_prompt = cx.new(|cx| PermissionPrompt::new(cx));
         let diff_view = cx.new(|cx| DiffView::new(fixture_diffs(), cx));
@@ -317,6 +279,7 @@ impl CuartelApp {
             actor_key: format!("cuartel-{session_id}"),
             workspace_id: "workspace-default".to_string(),
             agent_mode: Some(self.next_agent_mode),
+            cwd: worktree_path.clone(),
         };
 
         let session_host = cx.new({
@@ -343,6 +306,7 @@ impl CuartelApp {
             permission_prompt,
             session_host,
             state: SessionState::Created,
+            worktree_path,
             _host_sub: host_sub,
             _perm_sub: perm_sub,
         };
@@ -356,20 +320,30 @@ impl CuartelApp {
     }
 
     fn close_session(&mut self, session_id: &str, cx: &mut Context<Self>) {
-        if self.sessions.len() <= 1 {
-            return;
-        }
         let Some(idx) = self.find_slot_idx(session_id) else {
             return;
         };
-        self.sessions.remove(idx);
+        let removed = self.sessions.remove(idx);
 
-        if self.active_session_idx >= self.sessions.len() {
-            self.active_session_idx = self.sessions.len() - 1;
-        } else if idx < self.active_session_idx {
+        // Best-effort worktree cleanup. Worktree path was attached to
+        // the session via the worktree module; if it was a noop (no git
+        // workspace) the helper short-circuits.
+        worktree::remove_for(&self.workspace_path, &removed.id);
+
+        if self.sessions.is_empty() {
+            self.active_session_idx = 0;
+            self.sync_tab_bar(cx);
+            self.sync_sidebar(cx);
+            cx.notify();
+            return;
+        }
+
+        if idx < self.active_session_idx {
             self.active_session_idx -= 1;
-        } else if idx == self.active_session_idx {
-            self.active_session_idx = self.active_session_idx.min(self.sessions.len() - 1);
+        } else if idx == self.active_session_idx
+            && self.active_session_idx >= self.sessions.len()
+        {
+            self.active_session_idx = self.sessions.len() - 1;
         }
 
         self.sync_tab_bar(cx);
@@ -595,11 +569,14 @@ impl CuartelApp {
         };
         // Route to the correct session's host by matching on permission's session_id.
         // Fall back to the active session if no match (e.g. fixture data with no real session_id).
-        let slot = self
+        let Some(slot) = self
             .sessions
             .iter()
             .find(|s| s.id == session_id)
-            .unwrap_or_else(|| self.active_slot());
+            .or_else(|| self.active_slot())
+        else {
+            return;
+        };
         slot.session_host.update(cx, |host, _cx| {
             host.decide(id, approve);
         });
@@ -618,7 +595,9 @@ impl CuartelApp {
                 return;
             }
         };
-        let slot = self.active_slot();
+        let Some(slot) = self.active_slot() else {
+            return;
+        };
         let diffs: Vec<_> = slot.diff_view.read(_cx).diffs().to_vec();
         let decisions = event.decisions.clone();
         match review::plan_review(&diffs, &decisions, &host_root) {
@@ -695,12 +674,15 @@ impl CuartelApp {
             move |cx| PortsPanel::new(sid, cx)
         });
 
+        let worktree_path = worktree::create_for(&self.workspace_path, &session_id);
+
         let config = SessionHostConfig {
             session_id: session_id.clone(),
             agent_type: agent.rivet_name().to_string(),
             actor_key: format!("cuartel-{session_id}"),
             workspace_id: "workspace-default".to_string(),
             agent_mode: Some(self.next_agent_mode),
+            cwd: worktree_path.clone(),
         };
 
         let session_host = cx.new({
@@ -727,6 +709,7 @@ impl CuartelApp {
             permission_prompt,
             session_host,
             state: SessionState::Created,
+            worktree_path,
             _host_sub: host_sub,
             _perm_sub: perm_sub,
         };
@@ -759,7 +742,9 @@ impl CuartelApp {
         event: &PortForwardAdd,
         cx: &mut Context<Self>,
     ) {
-        let slot = self.active_slot();
+        let Some(slot) = self.active_slot() else {
+            return;
+        };
         log::info!(
             "[ports] add requested: session={} {} sandbox:{} host:{}",
             slot.id,
@@ -812,7 +797,9 @@ impl CuartelApp {
         event: &PortForwardRemove,
         _cx: &mut Context<Self>,
     ) {
-        let slot = self.active_slot();
+        let Some(slot) = self.active_slot() else {
+            return;
+        };
         log::info!(
             "[ports] remove requested: session={} id={}",
             slot.id,
@@ -827,7 +814,9 @@ impl CuartelApp {
         event: &PortForwardToggle,
         _cx: &mut Context<Self>,
     ) {
-        let slot = self.active_slot();
+        let Some(slot) = self.active_slot() else {
+            return;
+        };
         log::info!(
             "[ports] toggle requested: session={} id={} enabled={}",
             slot.id,
@@ -844,8 +833,14 @@ impl CuartelApp {
 }
 
 impl Render for CuartelApp {
-    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::dark();
+
+        let main_pane: AnyElement = if self.sessions.is_empty() {
+            self.render_empty_state(&theme, cx).into_any_element()
+        } else {
+            self.workspace.clone().into_any_element()
+        };
 
         div()
             .id("cuartel-root")
@@ -855,9 +850,54 @@ impl Render for CuartelApp {
             .bg(rgb(theme.bg_primary))
             .font_family("IBM Plex Sans")
             .child(self.sidebar.clone())
-            .child(self.workspace.clone())
+            .child(main_pane)
             .children(self.onboarding_view.clone())
             .children(self.settings_view.clone())
+    }
+}
+
+impl CuartelApp {
+    /// Centered "no sessions" pane shown when `self.sessions.is_empty()`.
+    /// The CTA fires `create_session` directly — same path as the tab-bar
+    /// `+` button.
+    fn render_empty_state(&self, theme: &Theme, cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .id("empty-state")
+            .flex()
+            .flex_1()
+            .flex_col()
+            .items_center()
+            .justify_center()
+            .gap_4()
+            .bg(rgb(theme.bg_primary))
+            .child(
+                div()
+                    .text_xl()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(rgb(theme.text_primary))
+                    .child("No sessions"),
+            )
+            .child(
+                div()
+                    .text_sm()
+                    .text_color(rgb(theme.text_muted))
+                    .child("Create a session to start working with an agent."),
+            )
+            .child(
+                div()
+                    .id("empty-state-create")
+                    .px_4()
+                    .py_2()
+                    .rounded_md()
+                    .bg(rgb(theme.accent))
+                    .text_sm()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(rgb(theme.bg_primary))
+                    .cursor_pointer()
+                    .hover(|s| s.opacity(0.85))
+                    .on_click(cx.listener(|this, _evt, _win, cx| this.create_session(cx)))
+                    .child("+ Create session"),
+            )
     }
 }
 

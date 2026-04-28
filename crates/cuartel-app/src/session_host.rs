@@ -156,6 +156,11 @@ pub struct SessionHostConfig {
     /// resolution from [`AgentMode::from_env`] for callers that haven't
     /// been migrated to the per-session picker yet.
     pub agent_mode: Option<AgentMode>,
+    /// Per-session working directory — typically a git worktree under
+    /// `~/cuartel/worktrees/<workspace>/<session-id>/`. Used as cwd for
+    /// the ACP / native-CLI subprocesses. `None` falls back to
+    /// `CUARTEL_ACP_CWD` / process cwd via `acp_session_cwd()`.
+    pub cwd: Option<PathBuf>,
 }
 
 /// Events forwarded from the tokio driver into the GPUI thread.
@@ -336,11 +341,11 @@ impl SessionHost {
     fn dispatch(&mut self, event: SessionHostEvent, cx: &mut Context<Self>) {
         match event {
             SessionHostEvent::Status(s) => {
-                log::info!("[session] {s}");
-                self.terminal.update(cx, |t, cx| {
-                    // ANSI dim grey for status lines.
-                    t.push_text(&format!("\x1b[38;5;242m• {s}\x1b[0m\r\n"), cx);
-                });
+                // Lifecycle/status messages ("waiting for sidecar",
+                // "ACP server up", boot/state announcements) go to the
+                // log file only — they used to clutter the chat
+                // transcript with noise the user never asked for.
+                log::info!(target: "cuartel::session", "{s} session={}", self.config.session_id);
             }
             SessionHostEvent::Bytes(bytes) => {
                 self.terminal.update(cx, |t, cx| t.push_bytes(&bytes, cx));
@@ -667,12 +672,15 @@ async fn run_driver_acp(
     event_tx: UnboundedSender<SessionHostEvent>,
     mut cmd_rx: UnboundedReceiver<SessionHostCommand>,
 ) {
-    let cwd = match acp_session_cwd() {
-        Ok(p) => p,
-        Err(msg) => {
-            let _ = event_tx.send(SessionHostEvent::Error(msg));
-            return;
-        }
+    let cwd = match config.cwd.clone() {
+        Some(p) if p.is_dir() => p,
+        _ => match acp_session_cwd() {
+            Ok(p) => p,
+            Err(msg) => {
+                let _ = event_tx.send(SessionHostEvent::Error(msg));
+                return;
+            }
+        },
     };
 
     // The session state machine starts at SessionState::Created and
@@ -887,12 +895,15 @@ fn spawn_native_claude_in_terminal(
     event_tx: &UnboundedSender<SessionHostEvent>,
     cx: &mut Context<SessionHost>,
 ) {
-    let cwd = match acp_session_cwd() {
-        Ok(p) => p,
-        Err(msg) => {
-            let _ = event_tx.send(SessionHostEvent::Error(msg));
-            return;
-        }
+    let cwd = match config.cwd.clone() {
+        Some(p) if p.is_dir() => p,
+        _ => match acp_session_cwd() {
+            Ok(p) => p,
+            Err(msg) => {
+                let _ = event_tx.send(SessionHostEvent::Error(msg));
+                return;
+            }
+        },
     };
 
     let claude_path = match resolve_claude_binary() {

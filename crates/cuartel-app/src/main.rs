@@ -1,6 +1,7 @@
 mod app;
 mod assets;
 mod diff_view;
+mod logging;
 mod onboarding_view;
 mod permission_prompt;
 mod ports_panel;
@@ -14,6 +15,7 @@ mod tab_bar;
 mod theme;
 mod timeline_view;
 mod workspace;
+mod worktree;
 
 use app::CuartelApp;
 use assets::Assets;
@@ -46,7 +48,10 @@ const RIVET_PORT: u16 = 6420;
 const GATEWAY_READY_TIMEOUT: Duration = Duration::from_secs(3);
 
 fn main() {
-    env_logger::init();
+    // Keep alive for the lifetime of `main` — drop happens at the end
+    // of `Application::run`, which never returns. The guard flushes the
+    // background writer thread on drop.
+    let _log_guard = logging::init();
 
     let app_config = AppConfig::default();
     let data_dir = app_config.data_dir.clone();
