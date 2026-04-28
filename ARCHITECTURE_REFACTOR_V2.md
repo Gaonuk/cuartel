@@ -923,6 +923,16 @@ Captured here so they're load-bearing in the design, not just notes elsewhere. E
 
 7. **MCP context efficiency: ship Code Mode early or defer?** Cloudflare collapsed 34 GitLab MCP tools (~15K tokens of definitions) into 2 portal-level meta-tools (KB 4.8). **Resolves based on dogfood-week MCP usage patterns.** If users wire many MCP servers, ship Code Mode in Phase E; if MCP usage stays modest, defer to Phase F.
 
+### UX follow-ups parked behind Pass 1 (2026-04-28)
+
+Tracking notes for ergonomics work landed in `feat/quiet-logs-and-empty-startup` so the next pass picks up cleanly:
+
+- **In-app log viewer.** Pass 1 routes `SessionHostEvent::Status` and the ACP/Native lifecycle messages to `~/Library/Logs/Cuartel/cuartel.log` via `tracing-appender` (daily rotation). Today the user reads via `Console.app` or `tail -f`. **Follow-up:** an in-app debug pane (sidebar overlay, Cmd+Shift+L) that tails the file and supports per-session filtering. Hooks already in place — `target: "cuartel::session"` includes `session=<id>`; the pane just needs to subscribe to the file via `notify` + a ring buffer. Defer until C2 lands persistence so we don't bake transient log structure into the schema.
+
+- **Worktrees need a real Workspace.** Pass 1 places worktrees at `~/cuartel/worktrees/<workspace-name>/<session-id>/` derived from `CUARTEL_ACP_CWD` / process cwd. Best-effort: skipped silently for non-git workspaces. **Follow-up (Phase C3):** the proper `Workspace` abstraction owns the parent directory + access policy + worktree pool; the per-session `cwd` field becomes a worktree handle owned by the workspace, not a free-form path.
+
+- **Session persistence (Pass 2 / Phase C2).** Pass 1 starts empty (`sessions: vec![]`); the user clicks **+ Create session**. Persistence pulled forward from C2 to make sessions reappear on relaunch is the next chunk of work — schema migration of `cuartel-db::sessions` (drop Rivet columns, add `agent_mode`, `worktree_path`, `last_active_at`), per-session transcript event log, lazy hydrate on tab click. Targeted as a separate PR because it owns its own migration risk.
+
 ### Architectural hedges (re-evaluate periodically, not actively decided)
 
 - **v3 architectural hedge: agent on host vs in sandbox.** Vercel Open Agents puts the agent **on the host** (KB 4.10). We chose the inverse because claude-code-acp runs all tools in-process. **If a future ACP server ships an "FS-via-ACP" mode**, we could flip D2 — agent on host, sandbox swappable, providers freely interchangeable. **Re-evaluate every ~6 months** as the ACP ecosystem matures. No action needed unless landscape shifts.
