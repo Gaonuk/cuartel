@@ -17,10 +17,41 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
+use std::path::Path;
+
 use crate::client::{AcpClient, AcpClientOptions};
 use crate::client_handler::{ClientHandler, NoOpClientHandler};
 use crate::error::Result;
 use crate::transport::{build_inherited_path, resolve_executable, SpawnOptions};
+
+/// Resolve `node` as a sibling of `npx` first (the common case for nvm/
+/// homebrew/system installs — npx and node always live in the same bin
+/// dir), then fall back to the standard probe order.
+fn resolve_node_for(npx: Option<&Path>) -> Option<std::path::PathBuf> {
+    if let Ok(p) = std::env::var("CUARTEL_NODE_PATH") {
+        let path = std::path::PathBuf::from(p);
+        if path.is_file() {
+            return Some(path);
+        }
+    }
+    if let Some(npx) = npx {
+        if let Some(parent) = npx.parent() {
+            let candidate = parent.join("node");
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+    }
+    resolve_executable("node", Some("CUARTEL_NODE_PATH"))
+}
+
+/// If `path` is a symlink, follow it (resolving relative targets against
+/// the symlink's parent) and return the resolved absolute path. If
+/// canonicalization fails (target doesn't exist, etc.), returns `None`
+/// — callers should fall back to using the symlink path directly.
+fn resolve_symlink_target(path: &Path) -> Option<std::path::PathBuf> {
+    std::fs::canonicalize(path).ok()
+}
 
 /// Pluggable sandbox provisioner.
 ///
@@ -56,47 +87,85 @@ pub struct LocalSandbox {
 }
 
 impl LocalSandbox {
-    /// LocalSandbox preset for `claude-code-acp` via `npx`. Inherits the
-    /// host process env so `~/.claude/` subscription auth (or
-    /// `ANTHROPIC_API_KEY`) flows through unchanged.
+    /// LocalSandbox preset for `claude-code-acp`.
     ///
-    /// Resolves `npx` to an absolute path at construction so the spawn
-    /// works even if the calling process's `$PATH` is stripped (macOS
-    /// GUI-launched apps, GPUI processes started outside a shell, etc.).
-    /// Probe order: `CUARTEL_NPX_PATH` env var → `$PATH` → common Node
-    /// install locations (nvm, homebrew, asdf, fnm, volta, pnpm, bun).
-    /// If npx isn't found anywhere, falls back to the literal `"npx"`
-    /// string and lets the spawn-time error surface the missing binary.
+    /// Robust spawn strategy: resolve `npx` to an absolute path, follow
+    /// its symlink to the underlying `npx-cli.js` script, locate `node`
+    /// (next to npx, or via PATH/fallbacks), and **spawn `node
+    /// <npx-cli.js> claude-code-acp` directly**. This bypasses the
+    /// `#!/usr/bin/env node` shebang in npx-cli.js, which otherwise
+    /// requires `node` to be on the spawned process's `$PATH` —
+    /// surfacing as misleading `npx: No such file or directory` errors
+    /// when GUI-launched processes inherit a stripped PATH that doesn't
+    /// include the user's nvm/asdf/etc bin dir.
+    ///
+    /// Probe order for both `npx` and `node`:
+    ///   1. `CUARTEL_NPX_PATH` / `CUARTEL_NODE_PATH` env vars
+    ///   2. The process's `$PATH`
+    ///   3. Sibling-of-npx (node usually lives next to npx)
+    ///   4. Common Node install locations (nvm, homebrew, asdf, fnm, volta, pnpm, bun)
     ///
     /// Also injects an extended `PATH` env into the spawned process so
-    /// npx can find its sibling `node` binary in the same directory
-    /// even when the parent's `$PATH` was empty.
+    /// claude-code-acp's child processes (mcp servers etc.) can find
+    /// their own `node`/`npx`.
     pub fn claude_code_acp() -> Self {
-        let resolved = resolve_executable("npx", Some("CUARTEL_NPX_PATH"));
-        let (command, env) = match resolved {
-            Some(abs) => {
-                let parent_dir = abs.parent().map(|p| p.to_path_buf());
+        let npx_path = resolve_executable("npx", Some("CUARTEL_NPX_PATH"));
+        let node_path = resolve_node_for(npx_path.as_deref());
+
+        let (command, args, env) = match (&npx_path, &node_path) {
+            // Best path: spawn `node <resolved-npx-cli-script> claude-code-acp`.
+            // Bypasses the shebang entirely.
+            (Some(npx), Some(node)) => {
+                let npx_script = resolve_symlink_target(npx).unwrap_or_else(|| npx.clone());
                 let mut env = Vec::new();
-                if let Some(dir) = parent_dir.as_deref() {
+                if let Some(dir) = node.parent() {
                     let inherited = build_inherited_path(&[dir]);
                     env.push(("PATH".to_string(), inherited));
                 }
-                (abs.to_string_lossy().into_owned(), env)
+                (
+                    node.to_string_lossy().into_owned(),
+                    vec![
+                        npx_script.to_string_lossy().into_owned(),
+                        "claude-code-acp".into(),
+                    ],
+                    env,
+                )
             }
-            None => {
+            // npx but no node: fall back to spawning npx directly. Inject
+            // npx's parent into PATH so the shebang-found env can locate node.
+            (Some(npx), None) => {
+                let mut env = Vec::new();
+                if let Some(dir) = npx.parent() {
+                    let inherited = build_inherited_path(&[dir]);
+                    env.push(("PATH".to_string(), inherited));
+                }
+                log::warn!(
+                    "cuartel-acp: resolved npx ({}) but could not locate `node`; \
+                     spawning via shebang. If you hit `No such file or directory`, \
+                     set CUARTEL_NODE_PATH=/absolute/path/to/node",
+                    npx.display()
+                );
+                (
+                    npx.to_string_lossy().into_owned(),
+                    vec!["claude-code-acp".into()],
+                    env,
+                )
+            }
+            // Nothing resolved: literal "npx" + warning.
+            (None, _) => {
                 log::warn!(
                     "cuartel-acp: could not resolve npx absolute path; \
                      spawn will rely on the spawned process's $PATH. \
                      If you hit `No such file or directory`, set \
                      CUARTEL_NPX_PATH=/absolute/path/to/npx",
                 );
-                ("npx".to_string(), Vec::new())
+                ("npx".to_string(), vec!["claude-code-acp".into()], Vec::new())
             }
         };
         Self {
             spawn_template: SpawnOptions {
                 command,
-                args: vec!["claude-code-acp".into()],
+                args,
                 cwd: PathBuf::from("/"), // overridden per-spawn
                 env,
                 clear_env: false,
@@ -154,14 +223,28 @@ mod tests {
     fn local_sandbox_default_uses_claude_code_acp() {
         let sb = LocalSandbox::default();
         assert_eq!(sb.kind(), "local");
-        // Command may be absolute (resolved npx) or literal "npx" if
-        // resolution failed; we don't assume the dev machine has npx.
         let cmd = sb.spawn_template.command.as_str();
-        assert!(
-            cmd == "npx" || cmd.ends_with("/npx"),
-            "expected npx (literal or absolute), got {cmd:?}",
-        );
-        assert_eq!(sb.spawn_template.args, vec!["claude-code-acp"]);
+        let args = &sb.spawn_template.args;
+        // Three valid shapes depending on what could be resolved on the
+        // dev machine:
+        //   - Best:  command=node, args=[<npx-cli.js>, "claude-code-acp"]
+        //   - OK:    command=<abs-npx>, args=["claude-code-acp"]
+        //   - None:  command="npx",     args=["claude-code-acp"]
+        if cmd.ends_with("/node") || cmd == "node" {
+            assert_eq!(args.len(), 2, "node spawn should pass npx-cli.js + cmd");
+            assert!(
+                args[0].ends_with(".js"),
+                "first arg should be npx-cli.js path, got {:?}",
+                args[0],
+            );
+            assert_eq!(args[1], "claude-code-acp");
+        } else {
+            assert!(
+                cmd == "npx" || cmd.ends_with("/npx"),
+                "expected node, npx (literal), or absolute npx; got {cmd:?}",
+            );
+            assert_eq!(args, &vec!["claude-code-acp".to_string()]);
+        }
     }
 
     #[test]
