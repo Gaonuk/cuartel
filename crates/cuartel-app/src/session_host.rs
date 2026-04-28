@@ -599,6 +599,13 @@ async fn run_driver_acp(
             return;
         }
     };
+
+    // The session state machine starts at SessionState::Created and
+    // only reaches Ready via Created → Boot → Booting → BootCompleted
+    // → Ready. workspace.rs gates the prompt input on Ready, so emit
+    // the full sequence (not just BootCompleted) at the appropriate
+    // moments so the input unlocks.
+    let _ = event_tx.send(SessionHostEvent::StateEvent(CoreSessionEvent::Boot));
     let _ = event_tx.send(SessionHostEvent::Status(format!(
         "ACP path: spawning claude-code-acp in {}",
         cwd.display()
@@ -607,6 +614,9 @@ async fn run_driver_acp(
     let client = match cuartel_acp::spawn_local_with_default_handler(cwd.clone()).await {
         Ok(c) => c,
         Err(e) => {
+            let _ = event_tx.send(SessionHostEvent::StateEvent(
+                CoreSessionEvent::Failed(format!("ACP spawn failed: {e}")),
+            ));
             let _ = event_tx.send(SessionHostEvent::Error(format!(
                 "claude-code-acp spawn failed: {e}"
             )));
@@ -621,12 +631,16 @@ async fn run_driver_acp(
     let session = match client.new_session(cwd).await {
         Ok(s) => s,
         Err(e) => {
+            let _ = event_tx.send(SessionHostEvent::StateEvent(
+                CoreSessionEvent::Failed(format!("new_session failed: {e}")),
+            ));
             let _ = event_tx.send(SessionHostEvent::Error(format!(
                 "new_session failed: {e}"
             )));
             return;
         }
     };
+    // Booting → Ready. Now the prompt input unlocks.
     let _ = event_tx.send(SessionHostEvent::StateEvent(CoreSessionEvent::BootCompleted));
     let _ = event_tx.send(SessionHostEvent::Status(format!(
         "ACP session ready ({})",
