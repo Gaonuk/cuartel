@@ -23,6 +23,14 @@ pub enum AgentType {
     ClaudeCode,
     Codex,
     OpenCode,
+    /// Factory's `droid` CLI (factory.ai). Native-only — no first-class
+    /// harness yet; the CLI is spawned in a PTY when the session uses
+    /// Native mode. See `AgentType::all_native_cli`.
+    Droid,
+    /// Sourcegraph's `amp` CLI (ampcode.com). Native-only.
+    Amp,
+    /// Google's `gemini` CLI (`@google/gemini-cli`). Native-only.
+    Gemini,
     Custom(String),
 }
 
@@ -33,6 +41,9 @@ impl AgentType {
             AgentType::ClaudeCode => "claude",
             AgentType::Codex => "codex",
             AgentType::OpenCode => "opencode",
+            AgentType::Droid => "droid",
+            AgentType::Amp => "amp",
+            AgentType::Gemini => "gemini",
             AgentType::Custom(name) => name,
         }
     }
@@ -43,6 +54,9 @@ impl AgentType {
             AgentType::ClaudeCode => "Claude Code",
             AgentType::Codex => "OpenAI Codex",
             AgentType::OpenCode => "OpenCode",
+            AgentType::Droid => "Droid",
+            AgentType::Amp => "Amp",
+            AgentType::Gemini => "Gemini",
             AgentType::Custom(name) => name,
         }
     }
@@ -54,6 +68,36 @@ impl AgentType {
             AgentType::Codex,
             AgentType::OpenCode,
         ]
+    }
+
+    /// Catalog of CLIs the Native PTY mode knows how to spawn. Wider
+    /// than `all_builtin()` because Native only needs a binary on PATH;
+    /// it doesn't depend on a `cuartel-core` harness implementation.
+    /// Order is the order shown in the per-session CLI picker.
+    pub fn all_native_cli() -> Vec<AgentType> {
+        vec![
+            AgentType::ClaudeCode,
+            AgentType::Codex,
+            AgentType::Pi,
+            AgentType::OpenCode,
+            AgentType::Droid,
+            AgentType::Amp,
+            AgentType::Gemini,
+        ]
+    }
+
+    /// Compact label for tab badges and dense pickers ("Claude", "Codex"…).
+    pub fn short_label(&self) -> &str {
+        match self {
+            AgentType::Pi => "Pi",
+            AgentType::ClaudeCode => "Claude",
+            AgentType::Codex => "Codex",
+            AgentType::OpenCode => "OpenCode",
+            AgentType::Droid => "Droid",
+            AgentType::Amp => "Amp",
+            AgentType::Gemini => "Gemini",
+            AgentType::Custom(name) => name,
+        }
     }
 }
 

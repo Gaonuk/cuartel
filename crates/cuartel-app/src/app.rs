@@ -8,7 +8,8 @@ use crate::settings_view::{SettingsDismissed, SettingsView};
 use crate::sidebar::{ServerSelected, SessionItem, SessionSelected, SettingsRequested, Sidebar};
 use crate::sidecar_host::SidecarStatus;
 use crate::tab_bar::{
-    AgentModeSelected, NewTabRequested, TabBar, TabCloseRequested, TabInfo, TabSelected,
+    AgentModeSelected, AgentTypeSelected, NewTabRequested, TabBar, TabCloseRequested, TabInfo,
+    TabSelected,
 };
 use crate::theme::Theme;
 use crate::timeline_view::{CheckpointDelete, CheckpointFork, CheckpointRestore, TimelineView};
@@ -39,6 +40,9 @@ struct SessionSlot {
     id: String,
     label: String,
     agent: AgentType,
+    /// Driver mode this session was created with. Surfaced as a tab badge
+    /// so the user can tell at a glance whether tab N is Rivet/ACP/Native.
+    agent_mode: AgentMode,
     terminal: Entity<TerminalView>,
     diff_view: Entity<DiffView>,
     timeline_view: Entity<TimelineView>,
@@ -77,6 +81,11 @@ pub struct CuartelApp {
     /// button. Seeded from `CUARTEL_USE_ACP` / `CUARTEL_NATIVE_CLAUDE`
     /// at startup; the tab-bar mode picker rebinds it on user click.
     next_agent_mode: AgentMode,
+    /// Which CLI flavor the next Native-mode session will spawn
+    /// (claude / codex / pi / opencode / droid / amp / gemini). Seeded
+    /// from the onboarding default; the tab-bar CLI picker rebinds it.
+    /// Non-Native modes ignore this and route through the harness layer.
+    next_agent_type: AgentType,
 }
 
 impl CuartelApp {
@@ -103,14 +112,17 @@ impl CuartelApp {
         let sidebar = cx.new(|cx| Sidebar::new(sidecar_status.clone(), sidebar_state, cx));
 
         let initial_mode = AgentMode::from_env();
-        let tab_bar = cx.new(|cx| TabBar::new(initial_mode, cx));
-
-        let session_id = "session-1".to_string();
-        let label = "Session 1".to_string();
         let initial_agent = onboarding_config
             .default_harness
             .clone()
             .unwrap_or(FALLBACK_AGENT);
+        let tab_bar = cx.new({
+            let agent = initial_agent.clone();
+            move |cx| TabBar::new(initial_mode, agent, cx)
+        });
+
+        let session_id = "session-1".to_string();
+        let label = "Session 1".to_string();
 
         let terminal = cx.new(|cx| TerminalView::new_headless(cx));
         let permission_prompt = cx.new(|cx| PermissionPrompt::new(cx));
@@ -147,6 +159,7 @@ impl CuartelApp {
         let config = SessionHostConfig {
             session_id: session_id.clone(),
             agent_type: initial_agent.rivet_name().to_string(),
+            agent: initial_agent.clone(),
             actor_key: format!("cuartel-{session_id}"),
             workspace_id: "workspace-default".to_string(),
             agent_mode: Some(initial_mode),
@@ -169,6 +182,7 @@ impl CuartelApp {
             id: session_id.clone(),
             label: label.clone(),
             agent: initial_agent.clone(),
+            agent_mode: initial_mode,
             terminal,
             diff_view,
             timeline_view,
@@ -184,6 +198,7 @@ impl CuartelApp {
             session_id: session_id.clone(),
             label: SharedString::from(label.clone()),
             agent: initial_agent.clone(),
+            agent_mode: initial_mode,
             state: SessionState::Created,
         };
         tab_bar.update(cx, |tb, cx| {
@@ -216,6 +231,7 @@ impl CuartelApp {
         cx.subscribe(&tab_bar, Self::on_tab_close_requested)
             .detach();
         cx.subscribe(&tab_bar, Self::on_agent_mode_selected).detach();
+        cx.subscribe(&tab_bar, Self::on_agent_type_selected).detach();
 
         let onboarding_view = if !onboarding_config.completed {
             let initial_default = onboarding_config.default_harness.clone();
@@ -251,6 +267,7 @@ impl CuartelApp {
             firewall,
             active_server_id: cuartel_db::servers::LOCAL_SERVER_ID.to_string(),
             next_agent_mode: initial_mode,
+            next_agent_type: initial_agent,
         }
     }
 
@@ -297,7 +314,14 @@ impl CuartelApp {
         self.next_session_num += 1;
         let session_id = format!("session-{num}");
         let label = format!("Session {num}");
-        let agent = self.default_agent();
+        // Native mode uses the per-session CLI picker; Rivet/ACP modes
+        // route through the harness layer, so they stick with the
+        // onboarding default (which is guaranteed to have a harness).
+        let agent = if self.next_agent_mode == AgentMode::NativeClaudeCli {
+            self.next_agent_type.clone()
+        } else {
+            self.default_agent()
+        };
 
         let terminal = cx.new(|cx| TerminalView::new_headless(cx));
         let permission_prompt = cx.new(|cx| PermissionPrompt::new(cx));
@@ -314,6 +338,7 @@ impl CuartelApp {
         let config = SessionHostConfig {
             session_id: session_id.clone(),
             agent_type: agent.rivet_name().to_string(),
+            agent: agent.clone(),
             actor_key: format!("cuartel-{session_id}"),
             workspace_id: "workspace-default".to_string(),
             agent_mode: Some(self.next_agent_mode),
@@ -336,6 +361,7 @@ impl CuartelApp {
             id: session_id.clone(),
             label: label.clone(),
             agent,
+            agent_mode: self.next_agent_mode,
             terminal,
             diff_view,
             timeline_view,
@@ -401,6 +427,7 @@ impl CuartelApp {
                 session_id: s.id.clone(),
                 label: SharedString::from(s.label.clone()),
                 agent: s.agent.clone(),
+                agent_mode: s.agent_mode,
                 state: s.state.clone(),
             })
             .collect();
@@ -464,6 +491,12 @@ impl CuartelApp {
             "onboarding completed: default_harness={:?}",
             self.onboarding_config.default_harness,
         );
+        // Reflect the new default in the tab-bar CLI picker so the user
+        // doesn't have to re-pick it.
+        self.next_agent_type = event.default_harness.clone();
+        self.tab_bar.update(cx, |tb, cx| {
+            tb.set_next_agent_type(event.default_harness.clone(), cx);
+        });
         self.onboarding_view = None;
         cx.notify();
     }
@@ -498,6 +531,12 @@ impl CuartelApp {
                 "settings: default_harness changed to {:?}",
                 self.onboarding_config.default_harness,
             );
+            if let Some(new_default) = event.default_harness.clone() {
+                self.next_agent_type = new_default.clone();
+                self.tab_bar.update(cx, |tb, cx| {
+                    tb.set_next_agent_type(new_default, cx);
+                });
+            }
         }
         self.settings_view = None;
         cx.notify();
@@ -579,6 +618,20 @@ impl CuartelApp {
             event.mode.short_label()
         );
         self.next_agent_mode = event.mode;
+    }
+
+    fn on_agent_type_selected(
+        &mut self,
+        _tab_bar: Entity<TabBar>,
+        event: &AgentTypeSelected,
+        _cx: &mut Context<Self>,
+    ) {
+        log::info!(
+            "[app] next-session agent type → {} ({}) (applies to next +tab in Native mode)",
+            event.agent.display_name(),
+            event.agent.rivet_name(),
+        );
+        self.next_agent_type = event.agent.clone();
     }
 
     fn on_permission_decision(
@@ -698,6 +751,7 @@ impl CuartelApp {
         let config = SessionHostConfig {
             session_id: session_id.clone(),
             agent_type: agent.rivet_name().to_string(),
+            agent: agent.clone(),
             actor_key: format!("cuartel-{session_id}"),
             workspace_id: "workspace-default".to_string(),
             agent_mode: Some(self.next_agent_mode),
@@ -720,6 +774,7 @@ impl CuartelApp {
             id: session_id.clone(),
             label,
             agent,
+            agent_mode: self.next_agent_mode,
             terminal,
             diff_view,
             timeline_view,
